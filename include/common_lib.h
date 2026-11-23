@@ -33,18 +33,56 @@ MTK_BUILD_MANIFOLD(state_input,
 ((vect3, gravity))
 );
 
+/* ---------------------------------------------------------------------------
+ * DIFF-DRIVE MODEL: state of the "IMU as output" filter (kf_output)
+ * ---------------------------------------------------------------------------
+ * The original Point-LIO output state was a free rigid body in 3D (30 DOF):
+ *   [pos, rot, offset_R_L_I, offset_T_L_I, vel(3), omg(3), acc(3), gravity, bg, ba]
+ *
+ * It is replaced by the differential-drive (non-holonomic) state of the
+ * technical note "Point-LIO with a Differential-Drive Kinematic Model", eq. (1):
+ *
+ *   x = [ G_p_B, G_R_B, v, a, B_omega, b_g, b_a ]  in  SO(3) x R^14,  DOF = 17
+ *
+ *   error-state index | symbol | meaning                                 | frame
+ *   ------------------+--------+-----------------------------------------+------
+ *    0.. 2   pos      |  p     | position of the drive-axle midpoint      | G
+ *    3.. 5   rot      |  R     | attitude of the robot base (base_link)   | B->G
+ *    6       vel      |  v     | forward speed along body x (e1)          | B
+ *    7       acc      |  a     | forward acceleration  (v_dot)            | B
+ *    8..10   omg      |  w     | angular velocity of the base             | B
+ *   11..13   bg       |  b_g   | gyroscope bias                           | I
+ *   14..16   ba       |  b_a   | accelerometer bias                       | I
+ *
+ * NOTE: the note orders the error state (theta, p, ...); the code keeps
+ * Point-LIO's (p, theta, ...) order so that the LiDAR update can keep using the
+ * first 6 columns (pos, rot) of P. Only the order differs, not the math.
+ *
+ * Removed w.r.t. the original:
+ *   - offset_R_L_I / offset_T_L_I : extrinsic estimation is disabled, the
+ *                                    LiDAR->base extrinsic is calibrated.
+ *   - 3D vel / 3D acc            : replaced by the scalars v, a (B_v = v*e1).
+ *   - gravity                    : fixed, G is gravity aligned (see gravity_world).
+ * ------------------------------------------------------------------------- */
 MTK_BUILD_MANIFOLD(state_output,
 ((vect3, pos))
 ((SO3, rot))
-((SO3, offset_R_L_I))
-((vect3, offset_T_L_I))
-((vect3, vel))
+((vect1, vel))
+((vect1, acc))
 ((vect3, omg))
-((vect3, acc))
-((vect3, gravity))
 ((vect3, bg))
 ((vect3, ba))
 );
+
+// Error-state indices of the diff-drive output state (see table above).
+#define DD_IDX_POS   (0)
+#define DD_IDX_ROT   (3)
+#define DD_IDX_VEL   (6)
+#define DD_IDX_ACC   (7)
+#define DD_IDX_OMG   (8)
+#define DD_IDX_BG    (11)
+#define DD_IDX_BA    (14)
+#define DD_DIM_STATE (17)
 
 MTK_BUILD_MANIFOLD(input_ikfom,
 ((vect3, acc))
@@ -67,7 +105,10 @@ MTK_BUILD_MANIFOLD(process_noise_output,
 );
 
 extern esekfom::esekf<state_input, 24, input_ikfom> kf_input;
-extern esekfom::esekf<state_output, 30, input_ikfom> kf_output;
+// DIFF-DRIVE MODEL: 17-DOF diff-drive state (was 30 for the free-body model).
+// The second template argument is the size of the (state-space) process noise
+// matrix Q, which equals the error-state dimension.
+extern esekfom::esekf<state_output, DD_DIM_STATE, input_ikfom> kf_output;
 
 #define PBWIDTH 30
 #define PBSTR "||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||"

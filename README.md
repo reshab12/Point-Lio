@@ -1,6 +1,17 @@
 # Point-LIO
 ## Point-LIO: Robust High-Bandwidth Lidar-Inertial Odometry
 
+> **Differential-drive fork (branch `diff-drive-model`).**
+> The IMU-as-output filter of this branch uses a *hard non-holonomic,
+> differential-drive* kinematic model (17-DOF state `[p, R, v, a, ω, b_g, b_a]`,
+> body velocity `B_v = [v, 0, 0]`, fixed gravity) instead of the free 3D
+> rigid-body model, with optional wheel-odometry and planar-prior updates.
+> The state frame is the robot base (`base_link`, origin at the drive-axle
+> midpoint). Start from `config/diff_drive.yaml` / `launch/mapping_diff_drive.launch`
+> and set the IMU→base extrinsic. All changes are marked `DIFF-DRIVE MODEL` in
+> the source; the full description is in `doc/PointLIO_DiffDrive_Changes.pdf`.
+> `use_imu_as_input: true` still runs the original free-body input model.
+
 ## 1. Introduction
 
 <div align="center">

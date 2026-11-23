@@ -31,6 +31,23 @@ extern double T1[MAXN], s_plot[MAXN], s_plot2[MAXN], s_plot3[MAXN], s_plot11[MAX
 void standard_pcl_cbk(const sensor_msgs::PointCloud2::ConstPtr &msg); 
 void livox_pcl_cbk(const livox_ros_driver::CustomMsg::ConstPtr &msg); 
 void imu_cbk(const sensor_msgs::Imu::ConstPtr &msg_in); 
+
+/* DIFF-DRIVE MODEL: wheel-odometry buffer (note, sec. 4.3).
+ * The wheel measurement is taken from a nav_msgs/Odometry message, as
+ * published by most diff-drive base controllers (e.g. diff_drive_controller):
+ *   v    = twist.twist.linear.x   (forward speed of base_link)
+ *   w_z  = twist.twist.angular.z  (yaw rate of base_link)
+ * The twist must be expressed in the child (base) frame, which is the
+ * convention of nav_msgs/Odometry. */
+struct WheelSample
+{
+    double t;   // stamp [s], same clock as the IMU / LiDAR
+    double v;   // forward speed [m/s]
+    double wz;  // yaw rate [rad/s]
+};
+extern std::deque<WheelSample> wheel_deque;
+extern std::mutex mtx_wheel;
+void wheel_cbk(const nav_msgs::Odometry::ConstPtr &msg_in);
 bool sync_packages(MeasureGroup &meas);
 
 // #endif

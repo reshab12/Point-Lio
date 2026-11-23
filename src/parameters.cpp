@@ -42,6 +42,16 @@ bool cut_frame_init = false; // true;
 
 MeasureGroup Measures;
 
+// DIFF-DRIVE MODEL: parameters (see parameters.h / config/diff_drive.yaml)
+std::vector<double> dd_imu_extrinT(3, 0.0), dd_imu_extrinR{1, 0, 0, 0, 1, 0, 0, 0, 1};
+std::vector<double> dd_lidar_extrinT, dd_lidar_extrinR;
+double dd_vel_cov = 0.0, dd_acc_cov = 0.1, dd_gyr_cov_xy = 0.001, dd_gyr_cov_z = 0.1;
+bool   wheel_en = false, wheel_use_yaw_rate = false, wheel_gate_en = true;
+std::string wheel_topic;
+double wheel_vel_cov = 0.0025, wheel_omg_cov = 0.01, wheel_vel_scale = 1.0, wheel_max_delay = 0.1;
+bool   planar_prior_en = false, height_prior_en = false;
+double planar_prior_std_deg = 1.5, planar_prior_rate = 20.0, height_prior_z0 = 0.0, height_prior_std = 0.05;
+
 ofstream fout_out, fout_imu_pbp;
 
 void readParameters(ros::NodeHandle &nh)
@@ -119,6 +129,50 @@ void readParameters(ros::NodeHandle &nh)
     ivox_options_.nearby_type_ = IVoxType::NearbyType::NEARBY18;
   }
     p_imu->gravity_ << VEC_FROM_ARRAY(gravity);
+
+  /* DIFF-DRIVE MODEL: parameters of the differential-drive output filter.
+   * Process noise defaults are derived from the original output-model values
+   * so that existing configs keep comparable magnitudes (Q * dt^2 convention):
+   *   acc_cov        : forward jerk           (was acc_cov_output, 3D)
+   *   gyr_cov_z      : yaw angular accel.     (was gyr_cov_output, 3D)
+   *   gyr_cov_xy     : roll/pitch angular acc. -> much smaller (terrain only) */
+  nh.param<std::vector<double>>("diff_drive/extrinsic_T_imu_in_base", dd_imu_extrinT, std::vector<double>{0.0, 0.0, 0.0});
+  nh.param<std::vector<double>>("diff_drive/extrinsic_R_imu_in_base", dd_imu_extrinR, std::vector<double>{1, 0, 0, 0, 1, 0, 0, 0, 1});
+  nh.param<std::vector<double>>("diff_drive/extrinsic_T_lidar_in_base", dd_lidar_extrinT, std::vector<double>());
+  nh.param<std::vector<double>>("diff_drive/extrinsic_R_lidar_in_base", dd_lidar_extrinR, std::vector<double>());
+  nh.param<double>("diff_drive/vel_cov", dd_vel_cov, 0.0);
+  nh.param<double>("diff_drive/acc_cov", dd_acc_cov, acc_cov_output);
+  nh.param<double>("diff_drive/gyr_cov_z", dd_gyr_cov_z, gyr_cov_output);
+  nh.param<double>("diff_drive/gyr_cov_xy", dd_gyr_cov_xy, 0.01 * gyr_cov_output);
+
+  nh.param<bool>("diff_drive/wheel/enable", wheel_en, false);
+  nh.param<std::string>("diff_drive/wheel/topic", wheel_topic, "/odom");
+  nh.param<bool>("diff_drive/wheel/use_yaw_rate", wheel_use_yaw_rate, false);
+  nh.param<bool>("diff_drive/wheel/chi2_gate_en", wheel_gate_en, true);
+  nh.param<double>("diff_drive/wheel/vel_cov", wheel_vel_cov, 0.0025);
+  nh.param<double>("diff_drive/wheel/omg_cov", wheel_omg_cov, 0.01);
+  nh.param<double>("diff_drive/wheel/vel_scale", wheel_vel_scale, 1.0);
+  nh.param<double>("diff_drive/wheel/max_delay", wheel_max_delay, 0.1);
+
+  nh.param<bool>("diff_drive/planar_prior/enable", planar_prior_en, false);
+  nh.param<double>("diff_drive/planar_prior/std_deg", planar_prior_std_deg, 1.5);
+  nh.param<double>("diff_drive/planar_prior/rate", planar_prior_rate, 20.0);
+  nh.param<bool>("diff_drive/height_prior/enable", height_prior_en, false);
+  nh.param<double>("diff_drive/height_prior/z0", height_prior_z0, 0.0);
+  nh.param<double>("diff_drive/height_prior/std", height_prior_std, 0.05);
+
+  if (dd_imu_extrinT.size() != 3 || dd_imu_extrinR.size() != 9)
+  {
+    ROS_ERROR("diff_drive/extrinsic_[T|R]_imu_in_base must have 3 / 9 entries, using identity.");
+    dd_imu_extrinT = std::vector<double>{0.0, 0.0, 0.0};
+    dd_imu_extrinR = std::vector<double>{1, 0, 0, 0, 1, 0, 0, 0, 1};
+  }
+  if (!dd_lidar_extrinT.empty() && (dd_lidar_extrinT.size() != 3 || dd_lidar_extrinR.size() != 9))
+  {
+    ROS_ERROR("diff_drive/extrinsic_[T|R]_lidar_in_base must have 3 / 9 entries, deriving it from the LiDAR-IMU extrinsic instead.");
+    dd_lidar_extrinT.clear();
+    dd_lidar_extrinR.clear();
+  }
 }
 
 Eigen::Matrix<double, 3, 1> SO3ToEuler(const SO3 &rot) 
@@ -161,10 +215,11 @@ void reset_cov(Eigen::Matrix<double, 24, 24> & P_init)
     P_init.block<6, 6>(15, 15) = MD(6,6)::Identity() * 0.001;
 }
 
-void reset_cov_output(Eigen::Matrix<double, 30, 30> & P_init_output)
+// DIFF-DRIVE MODEL: initial covariance of the 17-DOF diff-drive state.
+// Same magnitudes as the original output model: 0.01 for pose / motion states,
+// 0.001 for the IMU biases (the former gravity and extrinsic blocks are gone).
+void reset_cov_output(Eigen::Matrix<double, DD_DIM_STATE, DD_DIM_STATE> & P_init_output)
 {
-    P_init_output = MD(30, 30)::Identity() * 0.01;
-    P_init_output.block<3, 3>(21, 21) = MD(3,3)::Identity() * 0.0001;
-    // P_init_output.block<6, 6>(6, 6) = MD(6,6)::Identity() * 0.0001;
-    P_init_output.block<6, 6>(24, 24) = MD(6,6)::Identity() * 0.001;
+    P_init_output = MD(DD_DIM_STATE, DD_DIM_STATE)::Identity() * 0.01;
+    P_init_output.block<6, 6>(DD_IDX_BG, DD_IDX_BG) = MD(6,6)::Identity() * 0.001;
 }

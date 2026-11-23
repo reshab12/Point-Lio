@@ -68,6 +68,12 @@ struct dyn_share_modified
 	Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic> h_x;
 	Eigen::Matrix<T, 6, 1> z_IMU;
 	Eigen::Matrix<T, 6, 1> R_IMU;
+	// DIFF-DRIVE MODEL: full Jacobian of the IMU measurement w.r.t. the error
+	// state (6 x DOF). The original output model hard-coded H_I = [.. I .. I ..]
+	// (omg + bg, acc + ba). In the diff-drive model the IMU measurement is a
+	// nonlinear function of R, v, a, omega (eq. (7)-(13) of the note), so the
+	// measurement function has to provide the Jacobian explicitly.
+	Eigen::Matrix<T, 6, Eigen::Dynamic> h_x_IMU;
 	bool satu_check[6];
 };
 
@@ -207,13 +213,21 @@ public:
 			// dx_new = dx;
 			// P_ = P_propagated;
 
+			// DIFF-DRIVE MODEL: the LiDAR Jacobian only touches the leading
+			// h_cols error-state entries. The original code hard-coded 12
+			// (pos, rot, offset_R_L_I, offset_T_L_I). The diff-drive output
+			// state has no extrinsic states, so its LiDAR Jacobian is 1 x 6
+			// (pos, rot); the IMU-input filter still uses 12. The width is
+			// therefore taken from h_x at run time.
+			const int h_cols = h_x.cols();
+
 			Matrix<scalar_type, n, Eigen::Dynamic> PHT;
 			Matrix<scalar_type, Eigen::Dynamic, Eigen::Dynamic> HPHT;
 			Matrix<scalar_type, n, Eigen::Dynamic> K_;
 			if(n > dof_Measurement)
 			{
-				PHT = P_. template block<n, 12>(0, 0) * h_x.transpose();
-				HPHT = h_x * PHT.topRows(12);
+				PHT = P_.leftCols(h_cols) * h_x.transpose();
+				HPHT = h_x * PHT.topRows(h_cols);
 				for (int m = 0; m < dof_Measurement; m++)
 				{
 					HPHT(m, m) += m_noise;
@@ -222,63 +236,104 @@ public:
 			}
 			else
 			{
-				Matrix<scalar_type, 12, 12> HTH = m_noise * h_x.transpose() * h_x;
+				// Information form: K = (P^-1 + H^T R^-1 H)^-1 H^T R^-1, R = m_noise * I.
+				// DIFF-DRIVE MODEL (bug fix): the original code multiplied by
+				// m_noise instead of dividing by it, which made this branch
+				// (used when a time stamp carries >= DOF points) far too weak.
+				// With 17 instead of 30 states this branch is hit more often,
+				// so it is corrected here.
+				Matrix<scalar_type, Eigen::Dynamic, Eigen::Dynamic> HTH = h_x.transpose() * h_x / m_noise;
 				Matrix<scalar_type, n, n> P_inv = P_.inverse();
-				P_inv.template block<12, 12>(0, 0) += HTH;
+				P_inv.topLeftCorner(h_cols, h_cols) += HTH;
 				P_inv = P_inv.inverse();
-				K_ = P_inv.template block<n, 12>(0, 0) * h_x.transpose() * m_noise;
+				K_ = P_inv.leftCols(h_cols) * h_x.transpose() / m_noise;
 			}
-			Matrix<scalar_type, n, 1> dx_ = K_ * z; // - h) + (K_x - Matrix<scalar_type, n, n>::Identity()) * dx_new; 
+			Matrix<scalar_type, n, 1> dx_ = K_ * z; // - h) + (K_x - Matrix<scalar_type, n, n>::Identity()) * dx_new;
 			// state x_before = x_;
 
 			x_.boxplus(dx_);
 			{
-				P_ = P_ - K_*h_x*P_. template block<12, n>(0, 0);
+				P_ = P_ - K_*h_x*P_.topRows(h_cols);
 			}
 		}
 		return true;
 	}
 	
+	/* DIFF-DRIVE MODEL: IMU update with a full measurement Jacobian.
+	 *
+	 * The original implementation assumed the free-body output model, where
+	 *   h_I(x) = [omg + bg ; acc + ba]
+	 * so H_I consisted of identity blocks at hard-coded state indices
+	 * (15/24 for omg/bg, 18/27 for acc/ba in a 30-DOF state).
+	 *
+	 * In the diff-drive model (note, sec. 4.1) the IMU measurement is
+	 *   gyro : R_BI^T w + b_g
+	 *   acc  : R_BI^T ( a e1 + w x (v e1) + w x (w x r_BI) - R^T g ) + b_a
+	 * which depends on R, v, a, w, b_g, b_a. The measurement callback
+	 * (h_model_IMU_output) now fills dyn_share.z_IMU with the residual
+	 * z - h(x_hat) and dyn_share.h_x_IMU with the 6 x DOF Jacobian H_I.
+	 * Saturated channels are removed by zeroing their residual and Jacobian
+	 * row: such a row then contributes nothing to the update (K column = 0).
+	 */
 	void update_iterated_dyn_share_IMU() {
-		
+
 		dyn_share_modified<scalar_type> dyn_share;
 		for(int i=0; i<maximum_iter; i++)
 		{
 			dyn_share.valid = true;
+			dyn_share.h_x_IMU.setZero(6, n);
 			h_dyn_share_modified_2(x_, dyn_share);
 
-			Matrix<scalar_type, 6, 1> z = dyn_share.z_IMU;
-
-			Matrix<double, 30, 6> PHT;
-            Matrix<double, 6, 30> HP;
-            Matrix<double, 6, 6> HPHT;
-			PHT.setZero();
-			HP.setZero();
-			HPHT.setZero();
+			Matrix<scalar_type, 6, 1> r = dyn_share.z_IMU;
+			Matrix<scalar_type, 6, n> H = dyn_share.h_x_IMU;
 			for (int l_ = 0; l_ < 6; l_++)
 			{
-				if (!dyn_share.satu_check[l_])
+				if (dyn_share.satu_check[l_])
 				{
-					PHT.col(l_) = P_.col(15+l_) + P_.col(24+l_);
-					HP.row(l_) = P_.row(15+l_) + P_.row(24+l_);
+					r(l_) = 0.0;
+					H.row(l_).setZero();
 				}
 			}
-			for (int l_ = 0; l_ < 6; l_++)
-			{
-				if (!dyn_share.satu_check[l_])
-				{
-					HPHT.col(l_) = HP.col(15+l_) + HP.col(24+l_);
-				}
-				HPHT(l_, l_) += dyn_share.R_IMU(l_); //, l);
-			}
-        	Eigen::Matrix<double, 30, 6> K = PHT * HPHT.inverse(); 
-                                    
-            Matrix<scalar_type, n, 1> dx_ = K * z; 
-
-            P_ -= K * HP;
-			x_.boxplus(dx_);
+			Matrix<scalar_type, 6, 6> R = dyn_share.R_IMU.asDiagonal();
+			update_dense<6>(r, H, R);
 		}
 		return;
+	}
+
+	/* DIFF-DRIVE MODEL: generic dense EKF update on the manifold.
+	 *
+	 *   r : residual z - h(x_hat)                (dim x 1)
+	 *   H : Jacobian dh(x_hat [+] dx)/d dx at 0   (dim x DOF)
+	 *   R : measurement noise covariance          (dim x dim)
+	 *
+	 *   S = H P H^T + R,  K = P H^T S^-1,  x = x [+] K r,  P = (I - K H) P
+	 *
+	 * If chi2_gate > 0 the Mahalanobis distance r^T S^-1 r is compared with
+	 * it and the update is skipped (returns false) when the test fails. This
+	 * is used for wheel odometry to reject slip (note, sec. 4.3).
+	 * Used by the IMU update, the wheel-odometry update and the planar prior.
+	 */
+	template<int dim>
+	bool update_dense(const Matrix<scalar_type, dim, 1> &r,
+	                  const Matrix<scalar_type, dim, n> &H,
+	                  const Matrix<scalar_type, dim, dim> &R,
+	                  scalar_type chi2_gate = scalar_type(0),
+	                  scalar_type *chi2_out = nullptr)
+	{
+		const Matrix<scalar_type, n, dim> PHT = P_ * H.transpose();
+		const Matrix<scalar_type, dim, dim> S = H * PHT + R;
+		const Matrix<scalar_type, dim, dim> S_inv = S.inverse();
+		const scalar_type chi2 = (r.transpose() * S_inv * r)(0, 0);
+		if (chi2_out) *chi2_out = chi2;
+		if (chi2_gate > scalar_type(0) && chi2 > chi2_gate)
+		{
+			return false;
+		}
+		const Matrix<scalar_type, n, dim> K = PHT * S_inv;
+		const Matrix<scalar_type, n, 1> dx_ = K * r;
+		x_.boxplus(dx_);
+		P_ -= K * PHT.transpose();
+		return true;
 	}
 	
 	void change_x(state &input_state)

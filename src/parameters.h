@@ -73,6 +73,17 @@ extern double online_refine_time; //unit: s
 extern bool cut_frame_init;
 extern double time_update_last, time_current, time_predict_last_const, t_last;
 
+/* DIFF-DRIVE MODEL: parameters of the differential-drive output filter
+ * (namespace "diff_drive/" in the yaml file, see config/diff_drive.yaml). */
+extern std::vector<double> dd_imu_extrinT, dd_imu_extrinR;     // IMU in base  (r_BI, R_BI)
+extern std::vector<double> dd_lidar_extrinT, dd_lidar_extrinR; // LiDAR in base (t_BL, R_BL), optional
+extern double dd_vel_cov, dd_acc_cov, dd_gyr_cov_xy, dd_gyr_cov_z;
+extern bool   wheel_en, wheel_use_yaw_rate, wheel_gate_en;
+extern std::string wheel_topic;
+extern double wheel_vel_cov, wheel_omg_cov, wheel_vel_scale, wheel_max_delay;
+extern bool   planar_prior_en, height_prior_en;
+extern double planar_prior_std_deg, planar_prior_rate, height_prior_z0, height_prior_std;
+
 extern MeasureGroup Measures;
 
 extern ofstream fout_out, fout_imu_pbp;
@@ -80,4 +91,5 @@ void readParameters(ros::NodeHandle &n);
 void open_file();
 Eigen::Matrix<double, 3, 1> SO3ToEuler(const SO3 &orient);
 void reset_cov(Eigen::Matrix<double, 24, 24> & P_init);
-void reset_cov_output(Eigen::Matrix<double, 30, 30> & P_init_output);
+// DIFF-DRIVE MODEL: initial covariance of the 17-DOF diff-drive state.
+void reset_cov_output(Eigen::Matrix<double, DD_DIM_STATE, DD_DIM_STATE> & P_init_output);

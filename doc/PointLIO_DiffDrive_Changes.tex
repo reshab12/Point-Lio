@@ -1,0 +1,446 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage[margin=2.3cm]{geometry}
+\usepackage{amsmath,amssymb,bm}
+\usepackage{booktabs,longtable,array,tabularx}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage[most]{tcolorbox}
+\usepackage[htt]{hyphenat}
+\usepackage{hyperref}
+\hypersetup{colorlinks=true,linkcolor=blue!50!black,urlcolor=blue!50!black}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{4pt}
+
+\lstset{basicstyle=\ttfamily\footnotesize,columns=fullflexible,breaklines=true,
+  frame=single,framerule=0.3pt,rulecolor=\color{black!30},backgroundcolor=\color{black!3},
+  keywordstyle=\color{blue!60!black},commentstyle=\color{green!40!black},language=C++,
+  showstringspaces=false}
+\newtcolorbox{note}[1]{colback=blue!3,colframe=blue!40!black,fonttitle=\bfseries,title=#1}
+\newtcolorbox{warn}[1]{colback=orange!5,colframe=orange!60!black,fonttitle=\bfseries,title=#1}
+
+\newcommand{\f}[1]{\texttt{#1}}
+\newcommand{\R}{\mathbf{R}}
+\newcommand{\p}{\mathbf{p}}
+\newcommand{\w}{\bm{\omega}}
+\newcommand{\e}{\mathbf{e}}
+\newcommand{\g}{\mathbf{g}}
+\newcommand{\skw}[1]{\lfloor #1\rfloor_\times}
+
+\title{\textbf{Point-LIO with a Hard Differential-Drive Model}\\[2pt]
+\large Documentation of the code changes}
+\author{Branch \texttt{diff-drive-model} of \texttt{hku-mars/Point-LIO}}
+\date{23 November 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This document describes the changes made to Point-LIO to implement the
+\emph{hard} differential-drive (non-holonomic) kinematic model of the technical
+note \emph{``Point-LIO with a Differential-Drive Kinematic Model''} (referred to
+as \emph{the note}). The free 3D rigid-body model of the IMU-as-output filter is
+replaced by a 17-DOF state $[\p,\R,v,a,\w,\mathbf b_g,\mathbf b_a]$ with body
+velocity $^B\mathbf v=[v,0,0]^\top$ and fixed gravity; the IMU becomes a
+nonlinear measurement with a full Jacobian; the LiDAR model is expressed in the
+robot base frame; wheel odometry and a planar prior are available as optional
+updates. The document lists every changed file and function, maps each
+equation of the note to the code, explains behaviour changes, parameters and
+how the build was verified, and lists known limitations.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+%=====================================================================
+\section{Summary}
+%=====================================================================
+
+\begin{note}{What was done}
+\begin{itemize}\itemsep1pt
+\item Upstream repository \url{https://github.com/hku-mars/Point-LIO}, default
+  branch \f{point-lio-with-grid-map} (iVox map), commit \f{4b86a46}. All work is
+  on the local branch \f{diff-drive-model}; nothing is committed or pushed.
+\item The IMU-as-\emph{output} filter (\f{kf\_output}, the default,
+  \f{use\_imu\_as\_input: false}) now runs the hard diff-drive model of the
+  note, sections 2--6. The IMU-as-\emph{input} filter is left as the original
+  free-body model.
+\item Optional measurements of the note: wheel odometry (sec.\ 4.3) and planar /
+  height prior (sec.\ 4.4), both off by default.
+\item Every change in the source is marked with the comment tag
+  \f{DIFF-DRIVE MODEL} (search for it), with the equation numbers of the note.
+\item New files: \f{config/diff\_drive.yaml}, \f{launch/mapping\_diff\_drive.launch},
+  this document (\f{doc/}). \f{README.md} has a short pointer.
+\end{itemize}
+\end{note}
+
+\begin{warn}{Not tested on data}
+The code compiles and links against the real Linux ROS Noetic / PCL / Eigen
+headers and libraries, and all Jacobians were checked numerically
+(section~\ref{sec:verify}), but it has \textbf{not} been run on a robot or a
+rosbag. Before relying on it, run the sanity checks of section~\ref{sec:test}.
+\end{warn}
+
+\paragraph{Not implemented (by choice).} Soft non-holonomic variant (note 8.1),
+strictly planar SE(2) model (note 8.2), scale-factor calibration state for the
+wheel speed (note 4.3, optional), iterated (re-linearised) IMU update, publishing
+a pose projected to $(x,y,\psi)$ for AMCL (note sec.\ 9; the full 3D pose and
+the twist $(v,\w)$ are published, see section~\ref{sec:behaviour}).
+
+%=====================================================================
+\section{State definition}
+%=====================================================================
+
+\subsection{Old vs.\ new output state}
+
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+\toprule
+& original output state (30 DOF) & diff-drive output state (17 DOF)\\
+\midrule
+position & $^G\p_I$ (IMU) & $^G\p_B$ (axle midpoint)\\
+attitude & $^G\R_I$ & $^G\R_B$\\
+extrinsic & $\R_{LI}, \mathbf t_{LI}$ (6) & --- (calibrated, fixed)\\
+velocity & $^G\mathbf v_I\in\mathbb R^3$ & $v\in\mathbb R$, $^B\mathbf v=v\,\e_1$\\
+acceleration & $^I\mathbf a\in\mathbb R^3$ (specific force) & $a=\dot v\in\mathbb R$\\
+angular velocity & $^I\w$ & $^B\w$\\
+gravity & $^G\g$ (state) & --- fixed \f{gravity\_world}\\
+biases & $\mathbf b_g,\mathbf b_a$ & $\mathbf b_g,\mathbf b_a$\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Code representation (\f{include/common\_lib.h})}
+
+\begin{lstlisting}
+MTK_BUILD_MANIFOLD(state_output,
+((vect3, pos))   // p    : axle midpoint in G         error idx  0..2
+((SO3,  rot))    // R    : base_link -> G             error idx  3..5
+((vect1, vel))   // v    : forward speed along e1     error idx  6
+((vect1, acc))   // a    : forward acceleration       error idx  7
+((vect3, omg))   // w    : body angular velocity      error idx  8..10
+((vect3, bg))    // b_g  : gyro bias                  error idx 11..13
+((vect3, ba))    // b_a  : accelerometer bias         error idx 14..16
+);
+#define DD_IDX_POS 0 ... DD_IDX_BA 14, DD_DIM_STATE 17
+extern esekfom::esekf<state_output, DD_DIM_STATE, input_ikfom> kf_output;
+\end{lstlisting}
+
+\begin{note}{Ordering}
+The note orders the error state $(\delta\bm\theta,\delta\p,\dots)$. The code keeps
+Point-LIO's order $(\delta\p,\delta\bm\theta,\dots)$ so that the LiDAR update can
+keep using the leading columns of $\mathbf P$. Only the ordering differs; all
+blocks below are given in code order.
+\end{note}
+
+%=====================================================================
+\section{Equation-to-code map}
+%=====================================================================
+
+{\small\begin{longtable}{@{}>{\raggedright\arraybackslash}p{3.4cm}>{\raggedright\arraybackslash}p{6.2cm}>{\raggedright\arraybackslash}p{5.6cm}@{}}
+\toprule
+Note & Code & Remark\\
+\midrule\endhead
+(1) state & \f{common\_lib.h} \f{state\_output} & see above\\
+(2),(5),(6) process model & \f{Estimator.cpp} \f{get\_f\_output()} & $f=[\R\e_1v,\ \w,\ a,\ 0,0,0,0]$\\
+(20) $\mathbf F_x$ & \f{Estimator.cpp} \f{df\_dx\_output()} & only the $\mathbb R^n$ part; IKFoM adds $\mathrm{Exp}(-\w\Delta t)$ and $A(\cdot)$ for the attitude rows\\
+(19),(21) $\mathbf Q$ & \f{Estimator.cpp} \f{process\_noise\_cov\_output()} & state-space $Q$, Point-LIO's $Q\,\Delta t^2$ convention\\
+(3) body acceleration & \f{dd\_body\_acceleration()} & also used for logging\\
+(7)--(13) IMU model & \f{Estimator.cpp} \f{h\_model\_IMU\_output()} & residual + full $6\times17$ Jacobian\\
+IMU update & \f{esekfom.hpp} \f{update\_iterated\_dyn\_share\_IMU()} & generic, uses \f{h\_x\_IMU}\\
+(14),(15) LiDAR & \f{Estimator.cpp} \f{h\_model\_output()} & $1\times6$ Jacobian $(\p,\bm\theta)$\\
+LiDAR update & \f{esekfom.hpp} \f{update\_iterated\_dyn\_share\_modified()} & width taken from $\mathbf H$\\
+(16) wheel & \f{Estimator.cpp} \f{update\_wheel\_output()} & $\chi^2$ gate\\
+(17) planar / height prior & \f{Estimator.cpp} \f{update\_planar\_prior\_output()} & optional\\
+(22) update & \f{esekfom.hpp} \f{update\_dense<dim>()} & generic dense EKF update\\
+(18) initial alignment & \f{laserMapping.cpp} (\f{rot\_init\_base}) & gravity alignment of $B$\\
+Algorithm 1 ordering & \f{laserMapping.cpp} \f{fuse\_wheel\_until()}, \f{apply\_planar\_prior()} & time-ordered fusion\\
+\bottomrule
+\end{longtable}}
+
+%=====================================================================
+\section{File-by-file changes}
+%=====================================================================
+
+\subsection{\f{include/common\_lib.h}}
+\begin{itemize}
+\item \f{state\_output} replaced by the 17-DOF diff-drive state (removed: \f{offset\_R\_L\_I},
+  \f{offset\_T\_L\_I}, 3D \f{vel}, 3D \f{acc}, \f{gravity}).
+\item New index macros \f{DD\_IDX\_*} and \f{DD\_DIM\_STATE}=17.
+\item \f{kf\_output} is now \f{esekf<state\_output, 17, input\_ikfom>} (was 30).
+\item \f{state\_input} / \f{kf\_input} unchanged.
+\end{itemize}
+
+\subsection{\f{include/IKFoM/IKFoM\_toolkit/esekfom/esekfom.hpp}}
+\begin{enumerate}
+\item \textbf{\f{dyn\_share\_modified::h\_x\_IMU}} (new, $6\times n$): the IMU
+  measurement Jacobian supplied by the measurement function.
+\item \textbf{LiDAR update} \f{update\_iterated\_dyn\_share\_modified()}: the
+  Jacobian width was hard-coded to 12 (pos, rot, 2 extrinsic blocks). It is now
+  \f{h\_x.cols()} (6 for the diff-drive filter, 12 for the input filter), using
+  \f{P\_.leftCols(w)} / \f{P\_.topRows(w)}.
+\item \textbf{Bug fix in the information-form branch} (taken when a time stamp
+  carries $\ge n$ points): the original computed
+  $K=(\mathbf P^{-1}+r\,\mathbf H^\top\mathbf H)^{-1}\mathbf H^\top r$, i.e.\ it
+  \emph{multiplied} by the measurement variance $r$ instead of dividing. The
+  correct form $K=(\mathbf P^{-1}+\mathbf H^\top\mathbf H/r)^{-1}\mathbf H^\top/r$
+  is now used. With 17 instead of 30 states this branch is hit more often
+  (e.g.\ for spinning LiDARs where many points share a time stamp), which is why
+  it was fixed. Note that this also changes the behaviour of the input filter in
+  that branch.
+\item \textbf{IMU update} \f{update\_iterated\_dyn\_share\_IMU()} rewritten. The
+  original assumed $h_I=[\w+\mathbf b_g;\ \mathbf a+\mathbf b_a]$ with identity
+  blocks at hard-coded indices 15/18/24/27 of the 30-DOF state. Now the
+  measurement function returns residual and full Jacobian; saturated channels
+  are removed by zeroing their residual and Jacobian row (their Kalman-gain
+  column is then zero, identical to removing the row).
+\item \textbf{\f{update\_dense<dim>(r, H, R, chi2\_gate, chi2\_out)}} (new):
+  generic manifold EKF update $\mathbf S=\mathbf H\mathbf P\mathbf H^\top+\mathbf R$,
+  $\mathbf K=\mathbf P\mathbf H^\top\mathbf S^{-1}$, $\mathbf x\leftarrow\mathbf x\boxplus\mathbf K\mathbf r$,
+  $\mathbf P\leftarrow\mathbf P-\mathbf K\mathbf H\mathbf P$, with optional
+  Mahalanobis gate. Used by IMU, wheel and planar prior.
+\end{enumerate}
+
+\subsection{\f{src/Estimator.h / Estimator.cpp}}
+
+\paragraph{New globals.}
+\f{Lidar\_R/T\_wrt\_Body} (LiDAR$\to$state frame: $\R_{BL},\mathbf t_{BL}$ for the
+diff-drive filter, LiDAR$\to$IMU for the input filter),
+\f{Imu\_R/T\_wrt\_Base} ($\R_{BI},\mathbf r_{BI}$), \f{gravity\_world} ($^G\g$),
+helper \f{skew()}.
+
+\paragraph{\f{process\_noise\_cov\_output()}} ($17\times17$):
+$Q_{vv}=$\f{dd\_vel\_cov} (default 0, hard model), $Q_{aa}=$\f{dd\_acc\_cov},
+$Q_{\omega}=\mathrm{diag}(\f{gyr\_cov\_xy},\f{gyr\_cov\_xy},\f{gyr\_cov\_z})$,
+$Q_{b_g}$, $Q_{b_a}$ as before. Point-LIO's \f{predict()} adds $Q\,\Delta t^2$;
+this convention was kept so that magnitudes stay comparable to the original
+\f{acc\_cov\_output}/\f{gyr\_cov\_output} (note, end of sec.\ 5.2).
+
+\paragraph{\f{get\_f\_output()}} -- note (2),(5):
+\[
+f(\mathbf x)=\big[\ \underbrace{\R\e_1 v}_{\p},\ \underbrace{\w}_{\bm\theta},\ \underbrace{a}_{v},\ 0,\ \mathbf 0,\ \mathbf 0,\ \mathbf 0\ \big].
+\]
+\f{esekf::predict} applies $\R\,\mathrm{Exp}(\w\Delta t)$ and $\p+\R\e_1v\Delta t$, i.e.\ exactly (6).
+
+\paragraph{\f{df\_dx\_output()}} -- note (20), non-zero $\mathbb R^n$ blocks:
+\[
+\frac{\partial f_p}{\partial\bm\theta}=-v\,\R\skw{\e_1},\quad
+\frac{\partial f_p}{\partial v}=\R\e_1,\quad
+\frac{\partial f_\theta}{\partial\w}=\mathbf I_3,\quad
+\frac{\partial f_v}{\partial a}=1 .
+\]
+The attitude block $\mathrm{Exp}(-\w\Delta t)$ and the $A(\cdot)$ factor are
+built by IKFoM (this resolves the footnote of the note automatically).
+
+\paragraph{\f{h\_model\_output()}} (LiDAR, note (14),(15)):
+$\mathbf H_L=[\,\mathbf u^\top,\ (\skw{^B\p_m}\R^\top\mathbf u)^\top\,]$, $1\times6$; the
+extrinsic-estimation branch was removed. $^B\p_m=\R_{BL}{}^L\p_m+\mathbf t_{BL}$ is
+precomputed in \f{laserMapping.cpp} (\f{crossmat\_list}).
+
+\paragraph{\f{h\_model\_IMU\_output()}} -- note (7)--(13). Predicted measurement
+\begin{align*}
+\hat{\w}_m &= \R_{BI}^\top\w+\mathbf b_g,\\
+\hat{\mathbf a}_m &= \R_{BI}^\top\big(a\e_1+\w\times v\e_1+\w\times(\w\times\mathbf r_{BI})-\R^\top{}^G\g\big)+\mathbf b_a,
+\end{align*}
+residual $\mathbf z_I-\hat{\mathbf z}_I$ (accelerometer scaled by
+\f{G\_m\_s2/acc\_norm} as before) and Jacobian
+\[
+\mathbf H_I=\begin{bmatrix}
+\mathbf 0 & \mathbf 0 & \mathbf 0 & \mathbf 0 & \R_{BI}^\top & \mathbf I & \mathbf 0\\
+\mathbf 0 & -\R_{BI}^\top\skw{\R^\top\g} & \R_{BI}^\top(\w\times\e_1) & \R_{BI}^\top\e_1 & \mathbf H_{a\omega} & \mathbf 0 & \mathbf I
+\end{bmatrix},
+\]
+(columns $\p,\bm\theta,v,a,\w,\mathbf b_g,\mathbf b_a$) with
+$\mathbf H_{a\omega}=\R_{BI}^\top\big(-v\skw{\e_1}-\skw{\w\times\mathbf r_{BI}}-\skw{\w}\skw{\mathbf r_{BI}}\big)$.
+Saturation handling is unchanged (flags in \f{satu\_check}).
+
+\paragraph{\f{update\_wheel\_output(v\_m, $\omega_{z,m}$)}} -- note (16).
+Residual $[s\,v_m-\hat v,\ \omega_{z,m}-\hat\omega_z]$ ($s$ = \f{wheel/vel\_scale});
+$\mathbf H$ has a 1 at $v$ and at $\omega_z$. With \f{use\_yaw\_rate: false}
+(default) only $v_m$ is used (1 DoF). $\chi^2$ gate at 99\,\% (6.63 / 9.21).
+
+\paragraph{\f{update\_planar\_prior\_output()}} -- note (17). Residual
+$-[\e_1^\top;\e_2^\top]\R^\top\e_3$, $\mathbf H_\theta=[\e_1^\top;\e_2^\top]\skw{\R^\top\e_3}$,
+$\sigma=\sin(\f{std\_deg})$. Optional height prior $z_0-p_z$.
+
+\paragraph{\f{pointBodyToWorld()}} uses \f{Lidar\_R/T\_wrt\_Body}; the online
+extrinsic branch only exists for the input filter.
+
+\paragraph{\f{dd\_world\_velocity()}, \f{dd\_body\_acceleration()}} helpers for logging.
+
+\subsection{\f{src/laserMapping.cpp}}
+\begin{itemize}
+\item \textbf{Frames / extrinsics} (start of \f{main}): in output mode
+  $\R_{BI},\mathbf r_{BI}$ are read from \f{diff\_drive/extrinsic\_*\_imu\_in\_base};
+  $\R_{BL},\mathbf t_{BL}$ from \f{diff\_drive/extrinsic\_*\_lidar\_in\_base} or chained:
+  $\R_{BL}=\R_{BI}\R_{IL}$, $\mathbf t_{BL}=\R_{BI}\mathbf t_{IL}+\mathbf r_{BI}$.
+  \f{extrinsic\_est\_en} is forced to \f{false} with a warning. A determinant
+  check warns about invalid rotation matrices; the extrinsics are printed.
+\item \textbf{Initialisation}: \f{gravity\_world} is set from \f{mapping/gravity}
+  (gravity is no longer a state). The base attitude is gravity-aligned with
+  $\R_{BI}\,{}^I\g$ (from the mean accelerometer reading at standstill), or with
+  $\R_{BL}\,$\f{gravity\_init} without IMU; $v=a=0$, $\w=\mathbf 0$. The former
+  initialisation \f{acc = -R\^{}T g} is removed (the acceleration state is now the
+  forward acceleration, not the specific force).
+\item \textbf{\f{crossmat\_list}} uses $^B\p=\R_{BL}{}^L\p+\mathbf t_{BL}$.
+\item \textbf{Time-ordered fusion} (note, Algorithm 1): new
+  \f{propagate\_output\_to(t)}, \f{fuse\_wheel\_until(t)} and
+  \f{apply\_planar\_prior(t)}. Wheel samples are fused before each IMU sample
+  and before each LiDAR time stamp; samples up to \f{wheel/max\_delay} older than
+  the filter time are fused without propagation (latency), older ones dropped.
+  The planar prior runs after IMU updates at \f{planar\_prior/rate}.
+\item \textbf{Wheel subscriber} (\f{nav\_msgs/Odometry}) when \f{wheel/enable}.
+\item \textbf{Output}: \f{/aft\_mapped\_to\_init} now also carries the twist
+  (\f{linear.x}$=v$, \f{angular}$=\w$, frame \f{body}). Debug logs keep their
+  column layout: velocity column = $\R\e_1v$, acceleration column = eq.\ (3),
+  gravity column = fixed gravity.
+\item \f{P\_init\_output}, \f{Q\_output} are $17\times17$.
+\end{itemize}
+
+\subsection{\f{src/li\_initialization.h/.cpp}}
+\f{WheelSample}, \f{wheel\_deque} (mutex-protected) and \f{wheel\_cbk()}: reads
+\f{twist.twist.linear.x} and \f{twist.twist.angular.z}, applies the same time
+correction as the IMU, clears the buffer on time jumps backwards.
+
+\subsection{\f{src/parameters.h/.cpp}}
+New parameters (table~\ref{tab:params}); \f{reset\_cov\_output()} now builds a
+$17\times17$ matrix (0.01 for motion states, 0.001 for biases, as before).
+
+\subsection{New files}
+\f{config/diff\_drive.yaml} (template, based on \f{avia.yaml}, every new
+parameter documented), \f{launch/mapping\_diff\_drive.launch}, \f{doc/}.
+
+%=====================================================================
+\section{Parameters}\label{tab:params}
+%=====================================================================
+All new parameters live under \f{diff\_drive/} (private namespace of the node).
+
+{\small\begin{longtable}{@{}>{\raggedright\arraybackslash}p{5.2cm}>{\raggedright\arraybackslash}p{2.9cm}>{\raggedright\arraybackslash}p{7.0cm}@{}}
+\toprule
+Parameter & Default & Meaning\\
+\midrule\endhead
+\f{extrinsic\_T\_imu\_in\_base} & $[0,0,0]$ & IMU lever arm $\mathbf r_{BI}$ in $B$ [m]. \textbf{Set this.}\\
+\f{extrinsic\_R\_imu\_in\_base} & $\mathbf I$ & $\R_{BI}$ (IMU$\to$base), row-major\\
+\f{extrinsic\_T/R\_lidar\_in\_base} & (unset) & optional $\mathbf t_{BL},\R_{BL}$; otherwise chained via \f{mapping/extrinsic\_*}\\
+\f{acc\_cov} & \f{acc\_cov\_output} & forward-jerk noise ($Q_{aa}$)\\
+\f{gyr\_cov\_z} & \f{gyr\_cov\_output} & yaw angular-acceleration noise\\
+\f{gyr\_cov\_xy} & $0.01\cdot$\f{gyr\_cov\_output} & roll/pitch angular-acceleration noise ($\ll$ yaw)\\
+\f{vel\_cov} & 0 & optional noise on $v$ (soft slip allowance)\\
+\f{wheel/enable} & false & fuse wheel odometry\\
+\f{wheel/topic} & \f{/odom} & \f{nav\_msgs/Odometry}, twist in base frame\\
+\f{wheel/use\_yaw\_rate} & false & also fuse $\omega_z$\\
+\f{wheel/vel\_cov}, \f{omg\_cov} & 0.0025, 0.01 & wheel noise variances\\
+\f{wheel/vel\_scale} & 1.0 & wheel-radius calibration factor\\
+\f{wheel/chi2\_gate\_en} & true & slip rejection\\
+\f{wheel/max\_delay} & 0.1 s & latency tolerance\\
+\f{planar\_prior/enable}, \f{std\_deg}, \f{rate} & false, 1.5, 20 & roll/pitch prior (flat floors only)\\
+\f{height\_prior/enable}, \f{z0}, \f{std} & false, 0, 0.05 & $z$ prior (flat floors only)\\
+\bottomrule
+\end{longtable}}
+
+Existing parameters still used by the diff-drive filter: \f{imu\_meas\_acc\_cov},
+\f{imu\_meas\_omg\_cov}, \f{b\_acc\_cov}, \f{b\_gyr\_cov}, \f{lidar\_meas\_cov},
+\f{gravity}, \f{acc\_norm}, \f{satu\_*}, \f{mapping/extrinsic\_*} (if chaining).
+No longer used in output mode: \f{mapping/vel\_cov}, \f{extrinsic\_est\_en}.
+
+%=====================================================================
+\section{Behaviour changes to be aware of}\label{sec:behaviour}
+%=====================================================================
+\begin{itemize}
+\item \textbf{Frame ``body'' is now \f{base\_link}} for the default
+  (output) mode: the TF \f{camera\_init}$\to$\f{body}, \f{/aft\_mapped\_to\_init},
+  \f{/path} and \f{/cloud\_registered\_body} refer to the axle midpoint, not the IMU.
+\item \textbf{Existing configs still run}, but with the diff-drive model and,
+  without a \f{diff\_drive} section, with the IMU assumed at the axle midpoint.
+  Handheld/drone datasets violate the model and will perform badly.
+\item \textbf{\f{use\_imu\_as\_input: true}} runs the original free-body input
+  filter (with a warning); the diff-drive model is not used then.
+\item \textbf{Online extrinsic estimation} is disabled in output mode.
+\item \textbf{Bug fix} in the information-form LiDAR update (see
+  \f{esekfom.hpp}); affects both filters when $\ge n$ points share a time stamp.
+\item The odometry message now contains the twist $(v,\w)$ (covariances are not filled).
+\end{itemize}
+
+%=====================================================================
+\section{Build verification}\label{sec:verify}
+%=====================================================================
+The development machine is Windows without WSL, Docker or a native ROS, so a
+normal \f{catkin\_make} was not possible. Instead:
+
+\begin{enumerate}
+\item \textbf{Real headers and libraries.} ROS Noetic (robostack), PCL~1.15,
+  Eigen~3.4, Boost, glog, Python~3.12 were installed as \emph{linux-64} conda
+  packages. \f{livox\_ros\_driver/CustomMsg.h} and \f{CustomPoint.h} were
+  generated with \f{gencpp} from the Livox message definitions.
+\item \textbf{Cross-compilation} of all six translation units with clang~22
+  for \f{x86\_64-linux-gnu} against libstdc++~16 headers, \f{-fopenmp}, \f{-DMP\_EN}.
+  Deviations from the package's own CMake: \f{-std=c++17} (required by PCL~1.15;
+  Ubuntu~20.04's PCL~1.10 works with the package's C++14), a forced
+  \f{\#include <deque>} (upstream \f{preprocess.h} relies on a transitive include
+  that newer libstdc++ no longer provides) and three clang-only diagnostics
+  relaxed for the \emph{unchanged} upstream iVox headers
+  (\f{c++11-narrowing}, \f{missing-template-arg-list-after-template-kw}).
+  \textbf{The unmodified upstream code was compiled with the identical setup
+  first} to validate the toolchain: 0 errors. The modified code: \textbf{0
+  errors, 0 new warnings}.
+\item \textbf{Link check.} All objects were linked into a shared object with
+  \f{ld.lld --no-undefined} against the real linux-64 \f{libroscpp},
+  \f{librosconsole}, \f{libtf}, \f{libpcl\_*}, \f{libpython3.12}, \f{libglog},
+  \f{libomp}, glibc~2.28: \textbf{links without unresolved symbols}, for both
+  the original and the modified code.
+\item \textbf{Numerical Jacobian check.} The process model / IKFoM $\mathbf F_x$
+  assembly, $\mathbf H_I$, $\mathbf H_L$ and $\mathbf H_P$ were transcribed and
+  compared with central finite differences under the right-perturbation
+  convention for 200 random states, random $\R_{BI}$ and lever arms: max.\ abs.\
+  error $\le 10^{-5}$ (finite-difference level). Sanity: static level IMU reads
+  $[0,0,9.81]$; $\dot z=0$ when level and moving; $\dot z\approx v\sin\vartheta$
+  when pitched.
+\end{enumerate}
+
+On the robot (Ubuntu 20.04 + Noetic) build as usual:
+\begin{lstlisting}[language=bash]
+cd ~/catkin_ws/src && git clone <this repo> && cd Point-LIO && git checkout diff-drive-model
+cd ~/catkin_ws && catkin_make && source devel/setup.bash
+roslaunch point_lio mapping_diff_drive.launch config:=/path/to/your_diff_drive.yaml
+\end{lstlisting}
+
+%=====================================================================
+\section{Bring-up and test plan}\label{sec:test}
+%=====================================================================
+\begin{enumerate}
+\item \textbf{Extrinsics.} Set $\R_{BI},\mathbf r_{BI}$ (URDF / CAD) and check
+  the printed \f{[diff-drive]} lines at start-up. Wrong signs show up as a lateral
+  accelerometer residual $\propto v\,\omega_z$ in turns (note, sanity check iii).
+\item \textbf{Start at standstill} for $\approx$ 1--2\,s (IMU initialisation
+  averages 100 samples); roll/pitch are taken from gravity.
+\item \textbf{Flat loop}: compare $z$ and its $3\sigma$ bound with the original
+  Point-LIO. The bound should grow only with $v\cdot\sigma_\text{pitch}$.
+\item \textbf{Tuning}: start with \f{gyr\_cov\_xy} small (default
+  $0.01\cdot$\f{gyr\_cov\_z}); raise it on rough ground. Inflate
+  \f{imu\_meas\_acc\_cov} if the IMU is far from the axle or the chassis vibrates.
+\item \textbf{Wheel odometry}: enable, check that the rejection warning is rare;
+  calibrate \f{vel\_scale} on a straight run against LiDAR odometry.
+\item \textbf{Ramps}: keep the planar/height prior off.
+\end{enumerate}
+
+%=====================================================================
+\section{Known limitations}
+%=====================================================================
+\begin{itemize}
+\item The hard constraint $^B\mathbf v=v\e_1$ is violated by lateral slip,
+  skid in fast turns and suspension travel; use \f{diff\_drive/vel\_cov} only as
+  a crude allowance -- the proper fix is the soft model (note 8.1).
+\item The tangential term $\dot\w\times\mathbf r_{BI}$ is neglected (note 4.1).
+\item The IMU update is a single (non-iterated) EKF step although the model is
+  nonlinear; this is adequate at IMU rate (note 4.1).
+\item Yaw at start is arbitrary (minimal gravity alignment, as in the original);
+  the gyro bias is not initialised from the standstill mean (as in the original).
+\item Wheel samples arriving later than \f{max\_delay} behind the filter time
+  are dropped; there is no dedicated wheel/IMU time-offset parameter (the IMU
+  time offset is applied to the wheel stamps as well).
+\item Pose/twist covariances are not published.
+\end{itemize}
+
+\end{document}

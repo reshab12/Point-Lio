@@ -79,13 +79,16 @@ inline void dump_lio_state_to_log(FILE *fp)
     }
     else
     {
-        fprintf(fp, "%lf %lf %lf ", kf_output.x_.pos(0), kf_output.x_.pos(1), kf_output.x_.pos(2)); // Pos  
-        fprintf(fp, "%lf %lf %lf ", 0.0, 0.0, 0.0);                                        // omega  
-        fprintf(fp, "%lf %lf %lf ", kf_output.x_.vel(0), kf_output.x_.vel(1), kf_output.x_.vel(2)); // Vel  
-        fprintf(fp, "%lf %lf %lf ", 0.0, 0.0, 0.0);                                        // Acc  
-        fprintf(fp, "%lf %lf %lf ", kf_output.x_.bg(0), kf_output.x_.bg(1), kf_output.x_.bg(2));    // Bias_g  
-        fprintf(fp, "%lf %lf %lf ", kf_output.x_.ba(0), kf_output.x_.ba(1), kf_output.x_.ba(2));    // Bias_a  
-        fprintf(fp, "%lf %lf %lf ", kf_output.x_.gravity(0), kf_output.x_.gravity(1), kf_output.x_.gravity(2)); // Bias_a  
+        // DIFF-DRIVE MODEL: same column layout as before. Velocity is the
+        // world-frame velocity R e1 v, gravity is the fixed gravity_world.
+        const V3D vel_world = dd_world_velocity(kf_output.x_);
+        fprintf(fp, "%lf %lf %lf ", kf_output.x_.pos(0), kf_output.x_.pos(1), kf_output.x_.pos(2)); // Pos
+        fprintf(fp, "%lf %lf %lf ", 0.0, 0.0, 0.0);                                        // omega
+        fprintf(fp, "%lf %lf %lf ", vel_world(0), vel_world(1), vel_world(2)); // Vel
+        fprintf(fp, "%lf %lf %lf ", 0.0, 0.0, 0.0);                                        // Acc
+        fprintf(fp, "%lf %lf %lf ", kf_output.x_.bg(0), kf_output.x_.bg(1), kf_output.x_.bg(2));    // Bias_g
+        fprintf(fp, "%lf %lf %lf ", kf_output.x_.ba(0), kf_output.x_.ba(1), kf_output.x_.ba(2));    // Bias_a
+        fprintf(fp, "%lf %lf %lf ", gravity_world(0), gravity_world(1), gravity_world(2)); // gravity (fixed)  
     }
     fprintf(fp, "\r\n");  
     fflush(fp);
@@ -95,20 +98,16 @@ void pointBodyLidarToIMU(PointType const * const pi, PointType * const po)
 {
     V3D p_body_lidar(pi->x, pi->y, pi->z);
     V3D p_body_imu;
-    if (extrinsic_est_en)
+    // DIFF-DRIVE MODEL: "body" is base_link for the diff-drive output filter
+    // and the IMU for the input filter; only the input filter can still
+    // estimate the extrinsic online.
+    if (extrinsic_est_en && use_imu_as_input)
     {
-        if (!use_imu_as_input)
-        {
-            p_body_imu = kf_output.x_.offset_R_L_I * p_body_lidar + kf_output.x_.offset_T_L_I;
-        }
-        else
-        {
-            p_body_imu = kf_input.x_.offset_R_L_I * p_body_lidar + kf_input.x_.offset_T_L_I;
-        }
+        p_body_imu = kf_input.x_.offset_R_L_I * p_body_lidar + kf_input.x_.offset_T_L_I;
     }
     else
     {
-        p_body_imu = Lidar_R_wrt_IMU * p_body_lidar + Lidar_T_wrt_IMU;
+        p_body_imu = Lidar_R_wrt_Body * p_body_lidar + Lidar_T_wrt_Body;
     }
     po->x = p_body_imu(0);
     po->y = p_body_imu(1);
@@ -281,7 +280,19 @@ void publish_odometry(const ros::Publisher & pubOdomAftMapped)
         odomAftMapped.header.stamp = ros::Time().fromSec(lidar_end_time);
     }
     set_posestamp(odomAftMapped.pose.pose);
-    
+
+    // DIFF-DRIVE MODEL: publish the body twist (v, w) of base_link (child
+    // frame "body"). Lateral / vertical body velocity are zero by construction.
+    if (!use_imu_as_input)
+    {
+        odomAftMapped.twist.twist.linear.x  = kf_output.x_.vel(0);
+        odomAftMapped.twist.twist.linear.y  = 0.0;
+        odomAftMapped.twist.twist.linear.z  = 0.0;
+        odomAftMapped.twist.twist.angular.x = kf_output.x_.omg(0);
+        odomAftMapped.twist.twist.angular.y = kf_output.x_.omg(1);
+        odomAftMapped.twist.twist.angular.z = kf_output.x_.omg(2);
+    }
+
     pubOdomAftMapped.publish(odomAftMapped);
 
     static tf::TransformBroadcaster br;
@@ -313,6 +324,65 @@ void publish_path(const ros::Publisher pubPath)
     }
 }        
 
+/* DIFF-DRIVE MODEL: propagate the output filter (state and covariance) to
+ * time t, using the same bookkeeping as the original main loop:
+ *   time_predict_last_const : time up to which the state mean is propagated
+ *   time_update_last        : time up to which the covariance is propagated */
+void propagate_output_to(double t, Eigen::Matrix<double, DD_DIM_STATE, DD_DIM_STATE> &Q)
+{
+    double dt_cov = t - time_update_last; // esekf::predict takes dt by non-const reference
+    if (dt_cov > 0.0)
+    {
+        kf_output.predict(dt_cov, Q, input_in, false, true);
+        time_update_last = t;
+    }
+    double dt = t - time_predict_last_const;
+    if (dt > 0.0)
+    {
+        kf_output.predict(dt, Q, input_in, true, false);
+        time_predict_last_const = t;
+    }
+}
+
+/* DIFF-DRIVE MODEL: fuse all buffered wheel-odometry samples with stamp
+ * <= t_until in time order (note, Algorithm 1, lines 12-13).
+ * Samples that are slightly older than the current filter time (wheel
+ * messages usually arrive with some latency) are fused without propagation
+ * if they are less than wheel_max_delay old; older samples are dropped. */
+void fuse_wheel_until(double t_until, Eigen::Matrix<double, DD_DIM_STATE, DD_DIM_STATE> &Q)
+{
+    if (!wheel_en || use_imu_as_input) return;
+    while (true)
+    {
+        WheelSample w;
+        {
+            std::lock_guard<std::mutex> lock(mtx_wheel);
+            if (wheel_deque.empty() || wheel_deque.front().t > t_until) break;
+            w = wheel_deque.front();
+            wheel_deque.pop_front();
+        }
+        if (w.t < time_predict_last_const - wheel_max_delay) continue; // stale
+        if (w.t > time_predict_last_const) propagate_output_to(w.t, Q);
+        if (!update_wheel_output(w.v, w.wz))
+        {
+            ROS_WARN_THROTTLE(1.0, "wheel odometry rejected by chi2 gate (slip?) v=%.3f wz=%.3f", w.v, w.wz);
+        }
+    }
+}
+
+/* DIFF-DRIVE MODEL: optional planar / height prior at a low, fixed rate
+ * (note, sec. 4.4 / Algorithm 1, line 11). Called after IMU updates. */
+void apply_planar_prior(double t)
+{
+    if (!planar_prior_en && !height_prior_en) return;
+    static double t_last_prior = -1.0;
+    if (planar_prior_rate <= 0.0 || t_last_prior < 0.0 || t - t_last_prior >= 1.0 / planar_prior_rate)
+    {
+        update_planar_prior_output();
+        t_last_prior = t;
+    }
+}
+
 int main(int argc, char** argv)
 {
     ros::init(argc, argv, "laserMapping");
@@ -336,19 +406,54 @@ int main(int argc, char** argv)
     
         Lidar_T_wrt_IMU<<VEC_FROM_ARRAY(extrinT);
         Lidar_R_wrt_IMU<<MAT_FROM_ARRAY(extrinR);
-    
-    if (extrinsic_est_en)
+
+    /* DIFF-DRIVE MODEL: frames.
+     * Output filter (diff-drive): state frame = base_link B.
+     *   R_BI, r_BI from diff_drive/extrinsic_[R|T]_imu_in_base.
+     *   R_BL, t_BL from diff_drive/extrinsic_[R|T]_lidar_in_base if given,
+     *   otherwise chained from the LiDAR->IMU extrinsic:
+     *     R_BL = R_BI R_IL,  t_BL = R_BI t_IL + r_BI.
+     *   Extrinsic estimation is not available (no extrinsic states).
+     * Input filter (original): state frame = IMU, unchanged. */
+    if (!use_imu_as_input)
     {
-        if (!use_imu_as_input)
+        if (extrinsic_est_en)
         {
-            kf_output.x_.offset_R_L_I = Lidar_R_wrt_IMU;
-            kf_output.x_.offset_T_L_I = Lidar_T_wrt_IMU;
+            ROS_WARN("diff-drive model: online extrinsic estimation is not supported, extrinsic_est_en is set to false.");
+            extrinsic_est_en = false;
+        }
+        Imu_T_wrt_Base << VEC_FROM_ARRAY(dd_imu_extrinT);
+        Imu_R_wrt_Base << MAT_FROM_ARRAY(dd_imu_extrinR);
+        if (!dd_lidar_extrinT.empty())
+        {
+            Lidar_T_wrt_Body << VEC_FROM_ARRAY(dd_lidar_extrinT);
+            Lidar_R_wrt_Body << MAT_FROM_ARRAY(dd_lidar_extrinR);
         }
         else
         {
-            kf_input.x_.offset_R_L_I = Lidar_R_wrt_IMU;
-            kf_input.x_.offset_T_L_I = Lidar_T_wrt_IMU;
+            Lidar_R_wrt_Body = Imu_R_wrt_Base * Lidar_R_wrt_IMU;
+            Lidar_T_wrt_Body = Imu_R_wrt_Base * Lidar_T_wrt_IMU + Imu_T_wrt_Base;
         }
+        if (std::fabs(Imu_R_wrt_Base.determinant() - 1.0) > 1e-3 || std::fabs(Lidar_R_wrt_Body.determinant() - 1.0) > 1e-3)
+        {
+            ROS_WARN("diff-drive model: an extrinsic rotation is not a proper rotation matrix (det != 1), check the config.");
+        }
+        cout << "[diff-drive] R_BI (IMU in base):" << endl << Imu_R_wrt_Base << endl
+             << "[diff-drive] r_BI: " << Imu_T_wrt_Base.transpose() << endl
+             << "[diff-drive] R_BL (LiDAR in base):" << endl << Lidar_R_wrt_Body << endl
+             << "[diff-drive] t_BL: " << Lidar_T_wrt_Body.transpose() << endl;
+    }
+    else
+    {
+        Lidar_R_wrt_Body = Lidar_R_wrt_IMU;
+        Lidar_T_wrt_Body = Lidar_T_wrt_IMU;
+        ROS_WARN("use_imu_as_input = true: running the ORIGINAL free-body Point-LIO input model, the diff-drive model is only implemented for the output filter.");
+    }
+
+    if (extrinsic_est_en && use_imu_as_input)
+    {
+        kf_input.x_.offset_R_L_I = Lidar_R_wrt_IMU;
+        kf_input.x_.offset_T_L_I = Lidar_T_wrt_IMU;
     }
 
     p_imu->lidar_type = p_pre->lidar_type = lidar_type;
@@ -359,11 +464,12 @@ int main(int argc, char** argv)
     Eigen::Matrix<double, 24, 24> P_init; // = MD(18, 18)::Identity() * 0.1;
     reset_cov(P_init);
     kf_input.change_P(P_init);
-    Eigen::Matrix<double, 30, 30> P_init_output; // = MD(24, 24)::Identity() * 0.01;
+    // DIFF-DRIVE MODEL: 17 x 17 initial covariance and process noise.
+    Eigen::Matrix<double, DD_DIM_STATE, DD_DIM_STATE> P_init_output; // = MD(24, 24)::Identity() * 0.01;
     reset_cov_output(P_init_output);
     kf_output.change_P(P_init_output);
     Eigen::Matrix<double, 24, 24> Q_input = process_noise_cov_input();
-    Eigen::Matrix<double, 30, 30> Q_output = process_noise_cov_output();
+    Eigen::Matrix<double, DD_DIM_STATE, DD_DIM_STATE> Q_output = process_noise_cov_output();
     /*** debug record ***/
     FILE *fp;
     string pos_log_dir = root_dir + "/Log/pos_log.txt";
@@ -375,6 +481,13 @@ int main(int argc, char** argv)
         nh.subscribe(lid_topic, 200000, livox_pcl_cbk) : \
         nh.subscribe(lid_topic, 200000, standard_pcl_cbk);
     ros::Subscriber sub_imu = nh.subscribe(imu_topic, 200000, imu_cbk);
+    // DIFF-DRIVE MODEL: optional wheel odometry (nav_msgs/Odometry)
+    ros::Subscriber sub_wheel;
+    if (wheel_en && !use_imu_as_input)
+    {
+        sub_wheel = nh.subscribe(wheel_topic, 200000, wheel_cbk);
+        cout << "[diff-drive] fusing wheel odometry from " << wheel_topic << endl;
+    }
 
     ros::Publisher pubLaserCloudFullRes = nh.advertise<sensor_msgs::PointCloud2>
             ("/cloud_registered", 1000);
@@ -441,7 +554,8 @@ int main(int argc, char** argv)
                 {
                     // imu_next = *(imu_deque.front());
                     kf_input.x_.gravity << VEC_FROM_ARRAY(gravity);
-                    kf_output.x_.gravity << VEC_FROM_ARRAY(gravity);
+                    // DIFF-DRIVE MODEL: gravity is a fixed vector, not a state.
+                    gravity_world << VEC_FROM_ARRAY(gravity);
                     // kf_output.x_.acc << VEC_FROM_ARRAY(gravity);
                     // kf_output.x_.acc *= -1; 
 
@@ -462,9 +576,9 @@ int main(int argc, char** argv)
                 else
                 {
                     kf_input.x_.gravity << VEC_FROM_ARRAY(gravity); // _init);
-                    kf_output.x_.gravity << VEC_FROM_ARRAY(gravity); //_init);
-                    kf_output.x_.acc << VEC_FROM_ARRAY(gravity); //_init);
-                    kf_output.x_.acc *= -1; 
+                    // DIFF-DRIVE MODEL: fixed gravity; the forward acceleration
+                    // state a starts at 0 (robot at rest).
+                    gravity_world << VEC_FROM_ARRAY(gravity); //_init); 
                     p_imu->imu_need_init_ = false;
                     // p_imu->after_imu_init_ = true;
                 }     
@@ -512,10 +626,23 @@ int main(int argc, char** argv)
                     M3D rot_init;
                     p_imu->Set_init(tmp_gravity, rot_init);
                     kf_input.x_.rot = rot_init;
-                    kf_output.x_.rot = rot_init;
                     // kf_input.x_.rot; //.normalize();
                     // kf_output.x_.rot; //.normalize();
-                    kf_output.x_.acc = - rot_init.transpose() * kf_output.x_.gravity;
+
+                    /* DIFF-DRIVE MODEL: gravity alignment of the base frame.
+                     * tmp_gravity is gravity in the IMU frame (from the mean
+                     * accelerometer reading while stationary) or, without IMU,
+                     * gravity_init in the LiDAR frame. Rotate it into B and
+                     * align it with G_g: G_R_B * B_g = G_g. This sets roll and
+                     * pitch of the base; yaw is arbitrary (as in the original).
+                     * v, a and omega start at 0 (robot at rest). */
+                    M3D rot_init_base;
+                    V3D tmp_gravity_base = imu_en ? V3D(Imu_R_wrt_Base * tmp_gravity) : V3D(Lidar_R_wrt_Body * tmp_gravity);
+                    p_imu->Set_init(tmp_gravity_base, rot_init_base);
+                    kf_output.x_.rot = rot_init_base;
+                    kf_output.x_.vel(0) = 0.0;
+                    kf_output.x_.acc(0) = 0.0;
+                    kf_output.x_.omg.setZero();
                 }
                 else{
                 continue;}
@@ -579,7 +706,8 @@ int main(int argc, char** argv)
                 // }
                 // else
                 {
-                    point_this = Lidar_R_wrt_IMU * point_this + Lidar_T_wrt_IMU;
+                    // DIFF-DRIVE MODEL: LiDAR point in the state's body frame (base_link for the diff-drive filter)
+                    point_this = Lidar_R_wrt_Body * point_this + Lidar_T_wrt_Body;
                     M3D point_crossmat;
                     point_crossmat << SKEW_SYM_MATRX(point_this);
                     crossmat_list[i]=point_crossmat;
@@ -639,8 +767,10 @@ int main(int argc, char** argv)
                             }
                         }
                         bool imu_comes = time_current > imu_next.header.stamp.toSec();
-                        while (imu_comes) 
+                        while (imu_comes)
                         {
+                            // DIFF-DRIVE MODEL: wheel samples older than this IMU sample first (time order)
+                            fuse_wheel_until(imu_next.header.stamp.toSec(), Q_output);
                             imu_upda_cov = true;
                             angvel_avr<<imu_next.angular_velocity.x, imu_next.angular_velocity.y, imu_next.angular_velocity.z;
                             acc_avr   <<imu_next.linear_acceleration.x, imu_next.linear_acceleration.y, imu_next.linear_acceleration.z;
@@ -663,6 +793,7 @@ int main(int argc, char** argv)
                                     propag_time += omp_get_wtime() - propag_imu_start;
                                     double solve_imu_start = omp_get_wtime();
                                     kf_output.update_iterated_dyn_share_IMU();
+                                    apply_planar_prior(imu_next.header.stamp.toSec()); // DIFF-DRIVE MODEL (optional)
                                     solve_time += omp_get_wtime() - solve_imu_start;
                                 }
                             }
@@ -677,6 +808,9 @@ int main(int argc, char** argv)
                     {
                         break;
                     }
+
+                    // DIFF-DRIVE MODEL: remaining wheel samples up to this LiDAR point
+                    fuse_wheel_until(time_current, Q_output);
 
                     double dt = time_current - time_predict_last_const;
                     double propag_state_start = omp_get_wtime();
@@ -715,8 +849,9 @@ int main(int argc, char** argv)
                         if (runtime_pos_log)
                         {
                             euler_cur = SO3ToEuler(kf_output.x_.rot);
-                            fout_out << setw(20) << Measures.lidar_beg_time - first_lidar_time << " " << euler_cur.transpose() << " " << kf_output.x_.pos.transpose() << " " << kf_output.x_.vel.transpose() \
-                            <<" "<<kf_output.x_.omg.transpose()<<" "<<kf_output.x_.acc.transpose()<<" "<<kf_output.x_.gravity.transpose()<<" "<<kf_output.x_.bg.transpose()<<" "<<kf_output.x_.ba.transpose()<<" "<<feats_undistort->points.size()<<endl;
+                            // DIFF-DRIVE MODEL: same columns; vel = R e1 v (world), acc = body accel. eq. (3), gravity = fixed
+                            fout_out << setw(20) << Measures.lidar_beg_time - first_lidar_time << " " << euler_cur.transpose() << " " << kf_output.x_.pos.transpose() << " " << dd_world_velocity(kf_output.x_).transpose() \
+                            <<" "<<kf_output.x_.omg.transpose()<<" "<<dd_body_acceleration(kf_output.x_).transpose()<<" "<<gravity_world.transpose()<<" "<<kf_output.x_.bg.transpose()<<" "<<kf_output.x_.ba.transpose()<<" "<<feats_undistort->points.size()<<endl;
                         }
                     }
 
@@ -772,6 +907,7 @@ int main(int argc, char** argv)
 
                         if (!is_first_frame)
                         {
+                        fuse_wheel_until(time_current, Q_output); // DIFF-DRIVE MODEL
                         double dt = time_current - time_predict_last_const;
                         {
                             double dt_cov = time_current - time_update_last;
@@ -789,6 +925,7 @@ int main(int argc, char** argv)
                         acc_avr   <<imu_next.linear_acceleration.x, imu_next.linear_acceleration.y, imu_next.linear_acceleration.z; 
                         // acc_avr_norm = acc_avr * G_m_s2 / acc_norm;
                         kf_output.update_iterated_dyn_share_IMU();
+                        apply_planar_prior(time_current); // DIFF-DRIVE MODEL (optional)
                         imu_deque.pop_front();
                         if (imu_deque.empty()) break;
                         imu_last = imu_next;
@@ -1041,8 +1178,9 @@ int main(int argc, char** argv)
                     if (!use_imu_as_input)
                     {
                         euler_cur = SO3ToEuler(kf_output.x_.rot);
-                        fout_out << setw(20) << Measures.lidar_beg_time - first_lidar_time << " " << euler_cur.transpose() << " " << kf_output.x_.pos.transpose() << " " << kf_output.x_.vel.transpose() \
-                        <<" "<<kf_output.x_.omg.transpose()<<" "<<kf_output.x_.acc.transpose()<<" "<<kf_output.x_.gravity.transpose()<<" "<<kf_output.x_.bg.transpose()<<" "<<kf_output.x_.ba.transpose()<<" "<<feats_undistort->points.size()<<endl;
+                        // DIFF-DRIVE MODEL: same columns; vel = R e1 v (world), acc = body accel. eq. (3), gravity = fixed
+                        fout_out << setw(20) << Measures.lidar_beg_time - first_lidar_time << " " << euler_cur.transpose() << " " << kf_output.x_.pos.transpose() << " " << dd_world_velocity(kf_output.x_).transpose() \
+                        <<" "<<kf_output.x_.omg.transpose()<<" "<<dd_body_acceleration(kf_output.x_).transpose()<<" "<<gravity_world.transpose()<<" "<<kf_output.x_.bg.transpose()<<" "<<kf_output.x_.ba.transpose()<<" "<<feats_undistort->points.size()<<endl;
                     }
                     else
                     {

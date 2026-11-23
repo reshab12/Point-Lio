@@ -209,6 +209,27 @@ void imu_cbk(const sensor_msgs::Imu::ConstPtr &msg_in)
     // sig_buffer.notify_all();
 }
 
+// DIFF-DRIVE MODEL: wheel-odometry buffer, filled by wheel_cbk and consumed
+// in time order by the main loop (laserMapping.cpp, fuse_wheel_until()).
+std::deque<WheelSample> wheel_deque;
+std::mutex mtx_wheel;
+
+void wheel_cbk(const nav_msgs::Odometry::ConstPtr &msg_in)
+{
+    WheelSample s;
+    // same time correction as the IMU so that all sensors share one clock
+    s.t  = msg_in->header.stamp.toSec() - timediff_imu_wrt_lidar - time_lag_IMU_wtr_lidar;
+    s.v  = msg_in->twist.twist.linear.x;
+    s.wz = msg_in->twist.twist.angular.z;
+    std::lock_guard<std::mutex> lock(mtx_wheel);
+    if (!wheel_deque.empty() && s.t < wheel_deque.back().t)
+    {
+        ROS_WARN("wheel odometry loop back, clear buffer");
+        wheel_deque.clear();
+    }
+    wheel_deque.push_back(s);
+}
+
 bool sync_packages(MeasureGroup &meas)
 {
     {

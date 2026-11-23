@@ -1,0 +1,121 @@
+# =============================================================================
+# Point-LIO with the differential-drive (hard non-holonomic) kinematic model
+# -----------------------------------------------------------------------------
+# Template config: based on avia.yaml. Adapt the LiDAR / IMU section to your
+# sensors and fill in the "diff_drive" section with the extrinsics of YOUR
+# robot. With use_imu_as_input = false (default) the output filter runs the
+# diff-drive model; the state frame ("body") is base_link:
+#   origin = midpoint of the drive axle, x forward, y left, z up.
+# =============================================================================
+common:
+    lid_topic:  "/livox/lidar"
+    imu_topic:  "/livox/imu"
+    con_frame: false # true: if you need to combine several LiDAR frames into one
+    con_frame_num: 1 # the number of frames combined
+    cut_frame: false # true: if you need to cut one LiDAR frame into several subframes
+    cut_frame_time_interval: 0.1 # should be integral fraction of 1 / LiDAR frequency
+    time_diff_lidar_to_imu: 0.0 # Time offset between LiDAR and IMU calibrated by other algorithms, e.g., LI-Init (find in Readme)
+
+preprocess:
+    lidar_type: 1 # 4
+    scan_line: 6 # 32
+    timestamp_unit: 1           # the unit of time/t field in the PointCloud2 rostopic: 0-second, 1-milisecond, 2-microsecond, 3-nanosecond.
+    blind: 0.5
+
+mapping:
+    imu_en: true
+    extrinsic_est_en: false # not supported by the diff-drive model (forced to false)
+    imu_time_inte: 0.005 # = 1 / frequency of IMU
+    lidar_time_inte: 0.1
+    satu_acc: 3.0 # the saturation value of IMU's acceleration. not related to the units
+    satu_gyro: 35 # the saturation value of IMU's angular velocity. not related to the units
+    acc_norm: 1.0 # 9.810 # 1.0 for g as unit, 9.81 for m/s^2 as unit of the IMU's acceleration
+    lidar_meas_cov: 0.01 # 0.001; 0.01
+    # acc_cov_output / gyr_cov_output are only used as fall-back defaults for
+    # diff_drive/acc_cov and diff_drive/gyr_cov_z (see below).
+    acc_cov_output: 500
+    gyr_cov_output: 1000
+    b_acc_cov: 0.0001
+    b_gyr_cov: 0.0001
+    # IMU measurement noise. The diff-drive model neglects the tangential term
+    # w_dot x r_BI: inflate imu_meas_acc_cov if the IMU is far from the axle
+    # midpoint or if the chassis vibrates.
+    imu_meas_acc_cov: 0.1
+    imu_meas_omg_cov: 0.1
+    gyr_cov_input: 0.01 # for IMU as input model (original free-body model)
+    acc_cov_input: 0.1 # for IMU as input model (original free-body model)
+    plane_thr: 0.1 # 0.05, the threshold for plane criteria, the smaller, the flatter a plane
+    match_s: 81
+    ivox_grid_resolution: 2.0
+    # World gravity. The world frame G is gravity aligned, gravity is NOT a
+    # state of the diff-drive filter.
+    gravity: [0.0, 0.0, -9.810]
+    gravity_init: [0.0, 0.0, -9.810] # gravity in the initial LiDAR frame, only used without IMU
+    # LiDAR pose in the IMU frame (LiDAR -> IMU), as in the original Point-LIO.
+    # Used to derive LiDAR -> base when diff_drive/extrinsic_*_lidar_in_base is not given.
+    extrinsic_T: [ 0.04165, 0.02326, -0.0284 ]
+    extrinsic_R: [ 1, 0, 0,
+                   0, 1, 0,
+                   0, 0, 1 ]
+
+# -----------------------------------------------------------------------------
+# Differential-drive model (see doc/PointLIO_DiffDrive_Changes.pdf)
+# -----------------------------------------------------------------------------
+diff_drive:
+    # IMU pose in base_link (IMU -> base): R_BI, r_BI (lever arm, in metres).
+    # !!! REQUIRED: measure / take from your URDF. Identity = IMU at axle midpoint.
+    extrinsic_T_imu_in_base: [ 0.0, 0.0, 0.0 ]
+    extrinsic_R_imu_in_base: [ 1, 0, 0,
+                               0, 1, 0,
+                               0, 0, 1 ]
+    # Optional: LiDAR pose in base_link (LiDAR -> base): R_BL, t_BL.
+    # If omitted, it is chained from mapping/extrinsic_* and the IMU extrinsic:
+    #   R_BL = R_BI * R_IL,   t_BL = R_BI * t_IL + r_BI
+    # extrinsic_T_lidar_in_base: [ 0.0, 0.0, 0.0 ]
+    # extrinsic_R_lidar_in_base: [ 1, 0, 0,
+    #                              0, 1, 0,
+    #                              0, 0, 1 ]
+
+    # Process noise (same Q * dt^2 convention / magnitudes as the original
+    # acc_cov_output / gyr_cov_output):
+    acc_cov: 500        # forward jerk                    (default: mapping/acc_cov_output)
+    gyr_cov_z: 1000     # yaw angular acceleration        (default: mapping/gyr_cov_output)
+    gyr_cov_xy: 10      # roll/pitch angular acceleration (default: 0.01 * gyr_cov_output)
+                        #   small: roll/pitch rates only come from the terrain.
+                        #   increase for rough ground / vibration.
+    vel_cov: 0.0        # optional noise on the forward speed v (hard model: 0)
+
+    # Wheel odometry (recommended), nav_msgs/Odometry with the twist of base_link
+    # in the child frame (e.g. from diff_drive_controller).
+    wheel:
+        enable: false
+        topic: "/odom"
+        use_yaw_rate: false   # false: only the forward speed is fused (gyro is usually better)
+        vel_cov: 0.0025       # (0.05 m/s)^2
+        omg_cov: 0.01         # (0.1 rad/s)^2
+        vel_scale: 1.0        # wheel-radius calibration factor applied to v
+        chi2_gate_en: true    # reject slip (99 % chi^2 gate)
+        max_delay: 0.1        # [s] wheel samples older than this w.r.t. the filter time are dropped
+
+    # Optional priors for flat-floor robots. WRONG on ramps: leave disabled there.
+    planar_prior:
+        enable: false
+        std_deg: 1.5          # sigma of roll / pitch w.r.t. horizontal
+        rate: 20.0            # [Hz]
+    height_prior:
+        enable: false
+        z0: 0.0               # [m] height of base_link in the map frame
+        std: 0.05             # [m]
+
+odometry:
+    publish_odometry_without_downsample: false
+
+publish:
+    path_en: true                 # false: close the path output
+    scan_publish_en: true         # false: close all the point cloud output
+    scan_bodyframe_pub_en: false  # true: output the point cloud scans in the body frame (base_link for the diff-drive model)
+
+pcd_save:
+    pcd_save_en: false
+    interval: -1                 # how many LiDAR frames saved in each pcd file;
+                                 # -1 : all frames will be saved in ONE pcd file, may lead to memory crash when having too much frames.
