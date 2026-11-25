@@ -242,12 +242,17 @@ public:
 				// (used when a time stamp carries >= DOF points) far too weak.
 				// With 17 instead of 30 states this branch is hit more often,
 				// so it is corrected here.
-				Matrix<scalar_type, Eigen::Dynamic, Eigen::Dynamic> HTH = h_x.transpose() * h_x / m_noise;
+				// legacy_lidar_info_form = true restores the original (weak)
+				// weighting, for A/B testing only (diff_drive/debug/...).
+				const scalar_type w_info = legacy_lidar_info_form ? m_noise : scalar_type(1) / m_noise;
+				Matrix<scalar_type, Eigen::Dynamic, Eigen::Dynamic> HTH = h_x.transpose() * h_x * w_info;
 				Matrix<scalar_type, n, n> P_inv = P_.inverse();
 				P_inv.topLeftCorner(h_cols, h_cols) += HTH;
 				P_inv = P_inv.inverse();
-				K_ = P_inv.leftCols(h_cols) * h_x.transpose() / m_noise;
+				K_ = P_inv.leftCols(h_cols) * h_x.transpose() * w_info;
 			}
+			last_lidar_dof = dof_Measurement;
+			last_lidar_info_form = !(n > dof_Measurement);
 			Matrix<scalar_type, n, 1> dx_ = K_ * z; // - h) + (K_x - Matrix<scalar_type, n, n>::Identity()) * dx_new;
 			// state x_before = x_;
 
@@ -362,6 +367,14 @@ public:
 	}
 	cov P_;
 	state x_;
+	// DIFF-DRIVE MODEL: debugging aids.
+	//   legacy_lidar_info_form : use the original (m_noise-multiplying) weighting
+	//                            in the information-form LiDAR update (A/B test).
+	//   last_lidar_dof / last_lidar_info_form : size and branch of the last
+	//                            LiDAR update, for the jump diagnostics.
+	bool legacy_lidar_info_form = false;
+	int  last_lidar_dof = 0;
+	bool last_lidar_info_form = false;
 private:
 	measurement m_;
 	spMt l_;

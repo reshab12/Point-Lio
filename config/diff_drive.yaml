@@ -107,6 +107,13 @@ diff_drive:
         z0: 0.0               # [m] height of base_link in the map frame
         std: 0.05             # [m]
 
+    # Debugging aids
+    debug:
+        jump_log: true                 # warn when one filter step moves the pose more than below
+        jump_pos_thr: 0.05             # [m]
+        jump_rot_thr_deg: 1.0          # [deg]
+        legacy_lidar_info_form: false  # true = original weighting of the large-group LiDAR update (A/B test)
+
 odometry:
     publish_odometry_without_downsample: false
 

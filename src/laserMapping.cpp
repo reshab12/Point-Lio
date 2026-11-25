@@ -324,6 +324,37 @@ void publish_path(const ros::Publisher pubPath)
     }
 }        
 
+/* DIFF-DRIVE MODEL: jump diagnostics. Take a snapshot of the pose before a
+ * filter step and warn if the step moved it by more than the thresholds.
+ * Every message names the step (LiDAR / IMU / wheel / prior / predict), so a
+ * single run shows which part of the filter produces the leaps. */
+struct DDPoseSnap
+{
+    V3D p;
+    M3D R;
+};
+inline DDPoseSnap dd_snap()
+{
+    DDPoseSnap s;
+    s.p = kf_output.x_.pos;
+    s.R = kf_output.x_.rot;
+    return s;
+}
+void dd_check_jump(const DDPoseSnap &before, const char *step)
+{
+    if (!dd_jump_log) return;
+    const double dp = (kf_output.x_.pos - before.p).norm();
+    const double dth = Log(M3D(before.R.transpose() * kf_output.x_.rot)).norm() * 180.0 / PI_M;
+    if (dp > dd_jump_pos_thr || dth > dd_jump_rot_thr_deg)
+    {
+        const V3D eul = SO3ToEuler(kf_output.x_.rot) * 180.0 / PI_M;
+        ROS_WARN_THROTTLE(0.1, "[diff-drive jump] %s: dp=%.3f m dtheta=%.2f deg | lidar pts=%d %s | v=%.2f a=%.2f w=(%.2f %.2f %.2f) rpy=(%.1f %.1f %.1f) |ba|=%.3f |bg|=%.4f",
+            step, dp, dth, kf_output.last_lidar_dof, kf_output.last_lidar_info_form ? "info-form" : "cov-form",
+            kf_output.x_.vel(0), kf_output.x_.acc(0), kf_output.x_.omg(0), kf_output.x_.omg(1), kf_output.x_.omg(2),
+            eul(0), eul(1), eul(2), kf_output.x_.ba.norm(), kf_output.x_.bg.norm());
+    }
+}
+
 /* DIFF-DRIVE MODEL: propagate the output filter (state and covariance) to
  * time t, using the same bookkeeping as the original main loop:
  *   time_predict_last_const : time up to which the state mean is propagated
@@ -363,7 +394,10 @@ void fuse_wheel_until(double t_until, Eigen::Matrix<double, DD_DIM_STATE, DD_DIM
         }
         if (w.t < time_predict_last_const - wheel_max_delay) continue; // stale
         if (w.t > time_predict_last_const) propagate_output_to(w.t, Q);
-        if (!update_wheel_output(w.v, w.wz))
+        const DDPoseSnap snap = dd_snap();
+        const bool accepted = update_wheel_output(w.v, w.wz);
+        dd_check_jump(snap, "wheel update");
+        if (!accepted)
         {
             ROS_WARN_THROTTLE(1.0, "wheel odometry rejected by chi2 gate (slip?) v=%.3f wz=%.3f", w.v, w.wz);
         }
@@ -378,7 +412,9 @@ void apply_planar_prior(double t)
     static double t_last_prior = -1.0;
     if (planar_prior_rate <= 0.0 || t_last_prior < 0.0 || t - t_last_prior >= 1.0 / planar_prior_rate)
     {
+        const DDPoseSnap snap = dd_snap();
         update_planar_prior_output();
+        dd_check_jump(snap, "planar/height prior");
         t_last_prior = t;
     }
 }
@@ -461,6 +497,10 @@ int main(int argc, char** argv)
 
     kf_input.init_dyn_share_modified_2h(get_f_input, df_dx_input, h_model_input);
     kf_output.init_dyn_share_modified_3h(get_f_output, df_dx_output, h_model_output, h_model_IMU_output);
+    // DIFF-DRIVE MODEL: A/B switch for the information-form LiDAR update fix
+    kf_output.legacy_lidar_info_form = dd_legacy_lidar_info_form;
+    kf_input.legacy_lidar_info_form  = dd_legacy_lidar_info_form;
+    if (dd_legacy_lidar_info_form) ROS_WARN("diff-drive debug: legacy (original) information-form LiDAR update weighting enabled.");
     Eigen::Matrix<double, 24, 24> P_init; // = MD(18, 18)::Identity() * 0.1;
     reset_cov(P_init);
     kf_input.change_P(P_init);
@@ -792,7 +832,11 @@ int main(int argc, char** argv)
 
                                     propag_time += omp_get_wtime() - propag_imu_start;
                                     double solve_imu_start = omp_get_wtime();
-                                    kf_output.update_iterated_dyn_share_IMU();
+                                    {
+                                        const DDPoseSnap snap = dd_snap(); // DIFF-DRIVE MODEL: jump diagnostics
+                                        kf_output.update_iterated_dyn_share_IMU();
+                                        dd_check_jump(snap, "IMU update");
+                                    }
                                     apply_planar_prior(imu_next.header.stamp.toSec()); // DIFF-DRIVE MODEL (optional)
                                     solve_time += omp_get_wtime() - solve_imu_start;
                                 }
@@ -823,7 +867,9 @@ int main(int argc, char** argv)
                             time_update_last = time_current;   
                         }
                     }
+                    const DDPoseSnap snap_pred = dd_snap(); // DIFF-DRIVE MODEL: jump diagnostics
                     kf_output.predict(dt, Q_output, input_in, true, false);
+                    dd_check_jump(snap_pred, "predict to LiDAR point");
                     propag_time += omp_get_wtime() - propag_state_start;
                     time_predict_last_const = time_current;
                     double t_update_start = omp_get_wtime();
@@ -834,11 +880,13 @@ int main(int argc, char** argv)
                         idx += time_seq[k];
                         continue;
                     }
-                    if (!kf_output.update_iterated_dyn_share_modified()) 
+                    const DDPoseSnap snap_lidar = dd_snap(); // DIFF-DRIVE MODEL: jump diagnostics
+                    if (!kf_output.update_iterated_dyn_share_modified())
                     {
                         idx = idx+time_seq[k];
                         continue;
                     }
+                    dd_check_jump(snap_lidar, "LiDAR update");
                     solve_start = omp_get_wtime();
                         
                     if (publish_odometry_without_downsample)
@@ -924,7 +972,11 @@ int main(int argc, char** argv)
                         angvel_avr<<imu_next.angular_velocity.x, imu_next.angular_velocity.y, imu_next.angular_velocity.z;
                         acc_avr   <<imu_next.linear_acceleration.x, imu_next.linear_acceleration.y, imu_next.linear_acceleration.z; 
                         // acc_avr_norm = acc_avr * G_m_s2 / acc_norm;
-                        kf_output.update_iterated_dyn_share_IMU();
+                        {
+                            const DDPoseSnap snap = dd_snap(); // DIFF-DRIVE MODEL: jump diagnostics
+                            kf_output.update_iterated_dyn_share_IMU();
+                            dd_check_jump(snap, "IMU update (no LiDAR points)");
+                        }
                         apply_planar_prior(time_current); // DIFF-DRIVE MODEL (optional)
                         imu_deque.pop_front();
                         if (imu_deque.empty()) break;

@@ -83,6 +83,9 @@ extern std::string wheel_topic;
 extern double wheel_vel_cov, wheel_omg_cov, wheel_vel_scale, wheel_max_delay;
 extern bool   planar_prior_en, height_prior_en;
 extern double planar_prior_std_deg, planar_prior_rate, height_prior_z0, height_prior_std;
+// DIFF-DRIVE MODEL: debugging switches (namespace "diff_drive/debug/")
+extern bool   dd_legacy_lidar_info_form, dd_jump_log;
+extern double dd_jump_pos_thr, dd_jump_rot_thr_deg;
 
 extern MeasureGroup Measures;
 

@@ -51,6 +51,8 @@ std::string wheel_topic;
 double wheel_vel_cov = 0.0025, wheel_omg_cov = 0.01, wheel_vel_scale = 1.0, wheel_max_delay = 0.1;
 bool   planar_prior_en = false, height_prior_en = false;
 double planar_prior_std_deg = 1.5, planar_prior_rate = 20.0, height_prior_z0 = 0.0, height_prior_std = 0.05;
+bool   dd_legacy_lidar_info_form = false, dd_jump_log = true;
+double dd_jump_pos_thr = 0.05, dd_jump_rot_thr_deg = 1.0;
 
 ofstream fout_out, fout_imu_pbp;
 
@@ -160,6 +162,16 @@ void readParameters(ros::NodeHandle &nh)
   nh.param<bool>("diff_drive/height_prior/enable", height_prior_en, false);
   nh.param<double>("diff_drive/height_prior/z0", height_prior_z0, 0.0);
   nh.param<double>("diff_drive/height_prior/std", height_prior_std, 0.05);
+
+  /* DIFF-DRIVE MODEL: debugging.
+   *   legacy_lidar_info_form : restore the original weighting of the
+   *       information-form LiDAR update (A/B test of the bug fix).
+   *   jump_log               : warn whenever a single filter step moves the
+   *       pose by more than jump_pos_thr [m] or jump_rot_thr_deg [deg]. */
+  nh.param<bool>("diff_drive/debug/legacy_lidar_info_form", dd_legacy_lidar_info_form, false);
+  nh.param<bool>("diff_drive/debug/jump_log", dd_jump_log, true);
+  nh.param<double>("diff_drive/debug/jump_pos_thr", dd_jump_pos_thr, 0.05);
+  nh.param<double>("diff_drive/debug/jump_rot_thr_deg", dd_jump_rot_thr_deg, 1.0);
 
   if (dd_imu_extrinT.size() != 3 || dd_imu_extrinR.size() != 9)
   {
