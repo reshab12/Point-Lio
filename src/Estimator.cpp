@@ -407,9 +407,30 @@ void h_model_IMU_output(state_output &s, esekfom::dyn_share_modified<double> &ek
 	const V3D w     = s.omg;
 	const V3D g_B   = R.transpose() * gravity_world;  // gravity expressed in B
 
+	/* DIFF-DRIVE MODEL (stability fix): angular rate used inside the
+	 * accelerometer model.
+	 * The centripetal term w x (v e1) and the lever-arm term w x (w x r_BI)
+	 * are bilinear / quadratic in w. Using the *state* w there (as in eq. (8))
+	 * couples the accelerometer to w through a strongly nonlinear Jacobian;
+	 * with a large lever arm (tens of cm) a single linearised EKF step can
+	 * then lock onto a wrong (w, a) pair and the filter diverges (observed on
+	 * a real robot: w_z -> 7 rad/s while standing, a -> -10 m/s^2).
+	 * With imu_gyro_in_acc_model = true (default) these terms use the
+	 * bias-corrected gyro reading w_g = R_BI (I_w_m - b_g) instead - the
+	 * standard lever-arm compensation of strapdown navigation. The accelerometer
+	 * model is then linear in (theta, v, a, b_a) and no longer depends on the
+	 * state w (H_aw = 0); w is observed by the gyroscope only. */
+	bool gyro_sat = false;
+	if (check_satu)
+	{
+		for (int i = 0; i < 3; i++) gyro_sat = gyro_sat || (fabs(angvel_avr(i)) >= 0.99 * satu_gyro);
+	}
+	const bool use_gyro = dd_imu_gyro_in_acc_model && !gyro_sat;
+	const V3D w_acc = use_gyro ? V3D(Imu_R_wrt_Base * (angvel_avr - s.bg)) : w;
+
 	// predicted measurements
-	const V3D acc_axle  = a * e1_ + w.cross(v * e1_);           // B_a_B, eq. (3)
-	const V3D acc_lever = w.cross(w.cross(r_BI));               // rigid-body transport to the IMU
+	const V3D acc_axle  = a * e1_ + w_acc.cross(v * e1_);       // B_a_B, eq. (3)
+	const V3D acc_lever = w_acc.cross(w_acc.cross(r_BI));       // rigid-body transport to the IMU
 	const V3D h_gyr = R_IB * w + s.bg;
 	const V3D h_acc = R_IB * (acc_axle + acc_lever - g_B) + s.ba;
 
@@ -422,9 +443,14 @@ void h_model_IMU_output(state_output &s, esekfom::dyn_share_modified<double> &ek
 	ekfom_data.h_x_IMU.block<3,3>(0, DD_IDX_OMG) = R_IB;
 	ekfom_data.h_x_IMU.block<3,3>(0, DD_IDX_BG)  = Eigen::Matrix3d::Identity();
 	ekfom_data.h_x_IMU.block<3,3>(3, DD_IDX_ROT) = -R_IB * skew(g_B);
-	ekfom_data.h_x_IMU.block<3,1>(3, DD_IDX_VEL) = R_IB * w.cross(e1_);
+	ekfom_data.h_x_IMU.block<3,1>(3, DD_IDX_VEL) = R_IB * w_acc.cross(e1_);
 	ekfom_data.h_x_IMU.block<3,1>(3, DD_IDX_ACC) = R_IB * e1_;
-	ekfom_data.h_x_IMU.block<3,3>(3, DD_IDX_OMG) = R_IB * (-v * skew(e1_) - skew(w.cross(r_BI)) - skew(w) * skew(r_BI));
+	if (!use_gyro)
+	{
+		// eq. (13); only when the state w is used in the accelerometer model
+		ekfom_data.h_x_IMU.block<3,3>(3, DD_IDX_OMG) = R_IB * (-v * skew(e1_) - skew(w.cross(r_BI)) - skew(w) * skew(r_BI));
+	}
+	// (with the gyro reading, the small dependence of w_g on b_g is neglected)
 	ekfom_data.h_x_IMU.block<3,3>(3, DD_IDX_BA)  = Eigen::Matrix3d::Identity();
 	if(check_satu)
 	{
@@ -475,7 +501,7 @@ void h_model_IMU_output(state_output &s, esekfom::dyn_share_modified<double> &ek
  * wheel_use_yaw_rate is false (default, the wheel yaw rate is usually less
  * reliable than the gyroscope) only v_m is used. A chi^2 gate (99 %: 6.63 for
  * 1 DoF, 9.21 for 2 DoF) rejects slip when wheel_gate_en is set. */
-bool update_wheel_output(double v_meas, double omega_z_meas)
+bool update_wheel_output(double v_meas, double omega_z_meas, bool use_gate)
 {
 	const double gate_1dof = 6.635, gate_2dof = 9.210;
 	const state_output &s = kf_output.x_;
@@ -489,7 +515,7 @@ bool update_wheel_output(double v_meas, double omega_z_meas)
 		Eigen::Matrix<double, 2, 2> Rn = Eigen::Matrix<double, 2, 2>::Zero();
 		Rn(0, 0) = wheel_vel_cov;
 		Rn(1, 1) = wheel_omg_cov;
-		return kf_output.update_dense<2>(r, H, Rn, wheel_gate_en ? gate_2dof : 0.0);
+		return kf_output.update_dense<2>(r, H, Rn, (wheel_gate_en && use_gate) ? gate_2dof : 0.0);
 	}
 	else
 	{
@@ -499,7 +525,7 @@ bool update_wheel_output(double v_meas, double omega_z_meas)
 		H(0, DD_IDX_VEL) = 1.0;
 		Eigen::Matrix<double, 1, 1> Rn;
 		Rn << wheel_vel_cov;
-		return kf_output.update_dense<1>(r, H, Rn, wheel_gate_en ? gate_1dof : 0.0);
+		return kf_output.update_dense<1>(r, H, Rn, (wheel_gate_en && use_gate) ? gate_1dof : 0.0);
 	}
 }
 

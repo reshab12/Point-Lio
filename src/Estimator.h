@@ -82,7 +82,7 @@ void h_model_IMU_output(state_output &s, esekfom::dyn_share_modified<double> &ek
  *                               Returns false if the chi^2 gate rejected it.
  *   update_planar_prior_output: soft "body z || world z" prior, note sec. 4.4,
  *                               plus optional height prior p_z = z0. */
-bool update_wheel_output(double v_meas, double omega_z_meas);
+bool update_wheel_output(double v_meas, double omega_z_meas, bool use_gate = true);
 void update_planar_prior_output();
 
 // DIFF-DRIVE MODEL: helpers to derive quantities that are no longer states.

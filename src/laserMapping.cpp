@@ -383,25 +383,51 @@ void propagate_output_to(double t, Eigen::Matrix<double, DD_DIM_STATE, DD_DIM_ST
 void fuse_wheel_until(double t_until, Eigen::Matrix<double, DD_DIM_STATE, DD_DIM_STATE> &Q)
 {
     if (!wheel_en || use_imu_as_input) return;
+    /* DIFF-DRIVE MODEL: wheel statistics, printed every 5 s, so that a
+     * silent failure (clock mismatch, wrong topic) is visible:
+     *   fused / rejected (chi2) / stale (older than max_delay) / pending
+     *   (stamped in the future w.r.t. the filter) and the last time offset
+     *   wheel stamp - filter time. */
+    static long n_fused = 0, n_rejected = 0, n_stale = 0, n_forced = 0;
+    static double t_last_accept = -1.0;
+    double offset_front = 0.0;
+    size_t n_pending = 0;
     while (true)
     {
         WheelSample w;
         {
             std::lock_guard<std::mutex> lock(mtx_wheel);
-            if (wheel_deque.empty() || wheel_deque.front().t > t_until) break;
+            n_pending = wheel_deque.size();
+            if (wheel_deque.empty()) break;
+            offset_front = wheel_deque.front().t - time_predict_last_const;
+            if (wheel_deque.front().t > t_until) break;
             w = wheel_deque.front();
             wheel_deque.pop_front();
         }
-        if (w.t < time_predict_last_const - wheel_max_delay) continue; // stale
+        if (w.t < time_predict_last_const - wheel_max_delay) { n_stale++; continue; } // stale
         if (w.t > time_predict_last_const) propagate_output_to(w.t, Q);
+        if (t_last_accept < 0.0) t_last_accept = w.t;
+        /* Gate lockout protection: if every sample has been rejected for more
+         * than 1 s, the filter (not the wheels) is most likely wrong - fuse
+         * the sample without the gate so the wheel speed can pull it back. */
+        const bool force = wheel_gate_en && (w.t - t_last_accept > 1.0);
         const DDPoseSnap snap = dd_snap();
-        const bool accepted = update_wheel_output(w.v, w.wz);
-        dd_check_jump(snap, "wheel update");
-        if (!accepted)
+        const bool accepted = update_wheel_output(w.v, w.wz, !force);
+        dd_check_jump(snap, force ? "wheel update (gate bypassed)" : "wheel update");
+        if (accepted)
         {
-            ROS_WARN_THROTTLE(1.0, "wheel odometry rejected by chi2 gate (slip?) v=%.3f wz=%.3f", w.v, w.wz);
+            n_fused++;
+            if (force) n_forced++;
+            t_last_accept = w.t;
+        }
+        else
+        {
+            n_rejected++;
+            ROS_WARN_THROTTLE(1.0, "wheel odometry rejected by chi2 gate (slip?) v_wheel=%.3f v_filter=%.3f wz=%.3f", w.v, kf_output.x_.vel(0), w.wz);
         }
     }
+    ROS_INFO_THROTTLE(5.0, "[diff-drive wheel] fused=%ld (gate bypassed %ld) rejected=%ld stale=%ld pending=%zu | next sample - filter time = %.3f s",
+                      n_fused, n_forced, n_rejected, n_stale, n_pending, offset_front);
 }
 
 /* DIFF-DRIVE MODEL: optional planar / height prior at a low, fixed rate

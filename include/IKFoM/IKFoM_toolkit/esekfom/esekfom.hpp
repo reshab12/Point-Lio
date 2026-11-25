@@ -337,7 +337,13 @@ public:
 		const Matrix<scalar_type, n, dim> K = PHT * S_inv;
 		const Matrix<scalar_type, n, 1> dx_ = K * r;
 		x_.boxplus(dx_);
-		P_ -= K * PHT.transpose();
+		// Joseph form P = (I-KH) P (I-KH)^T + K R K^T, then symmetrised: keeps P
+		// positive definite under round-off (the short form P -= K H P can
+		// lose definiteness after many high-rate updates, which then makes the
+		// filter diverge).
+		const cov IKH = cov::Identity() - K * H;
+		P_ = IKH * P_ * IKH.transpose() + K * R * K.transpose();
+		P_ = scalar_type(0.5) * (P_ + P_.transpose());
 		return true;
 	}
 	

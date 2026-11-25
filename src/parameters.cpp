@@ -52,6 +52,7 @@ double wheel_vel_cov = 0.0025, wheel_omg_cov = 0.01, wheel_vel_scale = 1.0, whee
 bool   planar_prior_en = false, height_prior_en = false;
 double planar_prior_std_deg = 1.5, planar_prior_rate = 20.0, height_prior_z0 = 0.0, height_prior_std = 0.05;
 bool   dd_legacy_lidar_info_form = false, dd_jump_log = true;
+bool   dd_imu_gyro_in_acc_model = true;
 double dd_jump_pos_thr = 0.05, dd_jump_rot_thr_deg = 1.0;
 
 ofstream fout_out, fout_imu_pbp;
@@ -169,6 +170,9 @@ void readParameters(ros::NodeHandle &nh)
    *   jump_log               : warn whenever a single filter step moves the
    *       pose by more than jump_pos_thr [m] or jump_rot_thr_deg [deg]. */
   nh.param<bool>("diff_drive/debug/legacy_lidar_info_form", dd_legacy_lidar_info_form, false);
+  // use the bias-corrected gyro reading (not the state w) for the centripetal /
+  // lever-arm terms of the accelerometer model (see h_model_IMU_output)
+  nh.param<bool>("diff_drive/imu_gyro_in_acc_model", dd_imu_gyro_in_acc_model, true);
   nh.param<bool>("diff_drive/debug/jump_log", dd_jump_log, true);
   nh.param<double>("diff_drive/debug/jump_pos_thr", dd_jump_pos_thr, 0.05);
   nh.param<double>("diff_drive/debug/jump_rot_thr_deg", dd_jump_rot_thr_deg, 1.0);
